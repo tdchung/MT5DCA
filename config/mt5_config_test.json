@@ -1,0 +1,23 @@
+{
+    "mt5": {
+        "login": 270044876,
+        "password": "zxCV!@#$1234",
+        "server": "Exness-MT5Trial17",
+        "timeout": 60000
+    },
+    "dca": {
+        "investment_amount": 1000.0,
+        "frequency": "weekly",
+        "symbols": ["EURUSD", "GBPUSD", "USDJPY"],
+        "auto_trading": false
+    },
+    "risk_management": {
+        "max_lot_size": 1.0,
+        "min_lot_size": 0.01,
+        "max_daily_trades": 10
+    },
+    "logging": {
+        "level": "INFO",
+        "file": "logs/dca_mt5.log"
+    }
+}
