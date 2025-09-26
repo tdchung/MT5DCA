@@ -15,6 +15,8 @@ from datetime import datetime, timedelta
 from mt5_connector import MT5Connection
 from config_manager import ConfigManager
 
+from Libs.telegramBot import TelegramBot
+
 try:
     import MetaTrader5 as mt5_api
 except ImportError:
@@ -26,6 +28,12 @@ if src_path not in sys.path:
     sys.path.insert(0, src_path)
 
 
+################################################################################################
+TELEGRAM_API_TOKEN = f"7763641173:AAFSk2MUmsbU21BvVKXiV4g4dMEXuWBGo-M"
+TELEGRAM_BOT_NAME = "@tdc_main_gold_bot"
+TELEGRAM_CHAT_ID = "1661018465"
+
+telegramBot = TelegramBot(TELEGRAM_API_TOKEN, TELEGRAM_BOT_NAME)
 
 ################################################################################################
 FIBONACCI_LEVELS = [1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89]
@@ -146,10 +154,12 @@ def place_pending_order(mt5_api, symbol, order_type, price, tp_price, volume=0.0
     if result.retcode != mt5_api.TRADE_RETCODE_DONE:
         if logger:
             logger.error(f"⭕️ :: {comment} :: Order failed, retcode: {result.retcode}, comment: {result.comment}")
+            telegramBot.send_message(f"⭕️ :: {comment} :: Order failed, retcode: {result.retcode}, comment: {result.comment}", chat_id=TELEGRAM_CHAT_ID)
         return None
     order_type_str = "BUY STOP" if order_type == mt5_api.ORDER_TYPE_BUY_STOP else "SELL STOP"
     if logger:
         logger.info(f"✅ :: {comment} :: {order_type_str} order placed: {volume} lots at {price:.2f}, TP: {tp_price:.2f}")
+        telegramBot.send_message(f"✅ :: {comment} :: {order_type_str} order placed: {volume} lots at {price:.2f}, TP: {tp_price:.2f}", chat_id=TELEGRAM_CHAT_ID)
     return result
 
 
@@ -224,7 +234,7 @@ def run_at_index(mt5_api, symbol, amount, index, price=0, logger=None):
 
     if logger:
         logger.info(f"Grid orders placed for index {index}: buy/sell stops at {buy_entry_1:.2f}, {buy_entry_2:.2f}, {buy_entry_3:.2f}, {sell_entry_1:.2f}, {sell_entry_2:.2f}, {sell_entry_3:.2f}")
-    
+
 
 def close_all_positions(mt5_api, symbol, logger=None):
     try:
@@ -233,6 +243,14 @@ def close_all_positions(mt5_api, symbol, logger=None):
             if logger:
                 logger.info(f"No open positions to close for {symbol}.")
             return
+        # Collect all order IDs from gDetailOrders with status 'placed'
+        order_ids = set()
+        for key, val in gDetailOrders.items():
+            if val.get('status') == 'placed' and val.get('order') is not None:
+                order_obj = val['order']
+                oid = getattr(order_obj, 'order', None)
+                if oid is not None:
+                    order_ids.add(oid)
         for pos in positions:
             ticket = getattr(pos, 'ticket', None)
             volume = getattr(pos, 'volume', None)
@@ -240,6 +258,9 @@ def close_all_positions(mt5_api, symbol, logger=None):
             if ticket is None or volume is None or type_ is None:
                 if logger:
                     logger.warning(f"Could not get ticket/volume/type for position: {pos}")
+                continue
+            # Only close positions matching gDetailOrders
+            if ticket not in order_ids:
                 continue
             # Determine close type
             if type_ == mt5_api.POSITION_TYPE_BUY:
@@ -292,11 +313,22 @@ def cancel_all_pending_orders(mt5_api, symbol, logger=None):
             if logger:
                 logger.info(f"No pending orders to cancel for {symbol}.")
             return
+        # Collect all order IDs from gDetailOrders with status 'placed'
+        order_ids = set()
+        for key, val in gDetailOrders.items():
+            if val.get('status') == 'placed' and val.get('order') is not None:
+                order_obj = val['order']
+                oid = getattr(order_obj, 'order', None)
+                if oid is not None:
+                    order_ids.add(oid)
         for order in orders:
             ticket = getattr(order, 'ticket', None)
             if ticket is None:
                 if logger:
                     logger.warning(f"Could not get ticket for order: {order}")
+                continue
+            # Only cancel pending orders matching gDetailOrders
+            if ticket not in order_ids:
                 continue
             request = {
                 "action": mt5_api.TRADE_ACTION_REMOVE,
@@ -315,6 +347,7 @@ def cancel_all_pending_orders(mt5_api, symbol, logger=None):
             else:
                 if logger:
                     logger.info(f"✅ Cancelled pending order {ticket} for {symbol}")
+                    telegramBot.send_message(f"✅ Cancelled pending order {ticket} for {symbol}", chat_id=TELEGRAM_CHAT_ID)
     except Exception as e:
         if logger:
             logger.error(f"Error cancelling all pending orders: {e}")
@@ -344,8 +377,25 @@ def main():
             logger.error("❌ Failed to connect to MT5")
             return
         logger.info(f"✅ Connected to Exness MT5 Account (Symbol: {symbol}, Trade Amount: {trade_amount})")
+        telegramBot.send_message(f"✅ Connected to Exness MT5 Account (Symbol: {symbol}, Trade Amount: {trade_amount})", chat_id=TELEGRAM_CHAT_ID)
         
-        # TODO: here
+        # Get start balance
+        start_balance = None
+        try:
+            acc_info = mt5.get_account_info() if hasattr(mt5, 'get_account_info') else None
+            if acc_info and hasattr(acc_info, 'balance'):
+                start_balance = acc_info.balance
+            else:
+                # fallback to MetaTrader5 API
+                acc_info_mt5 = mt5_api.account_info() if mt5_api else None
+                if acc_info_mt5 and hasattr(acc_info_mt5, 'balance'):
+                    start_balance = acc_info_mt5.balance
+        except Exception as e:
+            logger.error(f"Error getting start balance: {e}")
+        if start_balance is None:
+            start_balance = 0
+            
+        # Step 1: Close all existing positions and pending orders for the symbol
         run_at_index(mt5_api, symbol, trade_amount, index=gCurrentIdx, price=0, logger=logger)
         
         notified_filled = set()
@@ -399,18 +449,16 @@ def main():
                             logger.info(f"🔥 :: {order_comment} :: Pending order filled: ID {oid} | {side} | {order_price}")
                             notified_filled.add(oid)
                             logger.info(f"Filled order IDs: {notified_filled}")
+                            telegramBot.send_message(f"🔥 :: {order_comment} :: Pending order filled: ID {oid} | {side} | {order_price}", chat_id=TELEGRAM_CHAT_ID  )
                             run_at_index(mt5_api, symbol, trade_amount, gCurrentIdx, price=order_price, logger=logger)
-                
+                        
                 # check if Position closed (TP filled)
                 for oid in notified_filled:
                     if oid not in notified_tp:
                         if check_position_closed(mt5_api, oid, logger):
                             pnl = pos_closed_pnl(mt5_api, oid, logger)
                             closed_pnl += pnl
-                            # logger.info(f"❤️ TP filled: Position ID {oid} closed | P&L: ${pnl:.2f} All Closed P&L: ${closed_pnl:.2f}")
                             notified_tp.add(oid)
-                            # logger.info(f"TP filled order IDs: {notified_tp}")
-                            # Get the index of the order that hit TP
                             hit_index = None
                             hit_side = None
                             hit_tp_price = None
@@ -444,6 +492,7 @@ def main():
                             logger.info(f"❤️ :: {order_comment} :: TP filled: Position ID {oid} closed | P&L: ${pnl:.2f} All Closed P&L: ${closed_pnl:.2f}")
                             logger.info(f"TP filled order IDs: {notified_tp}")
                             logger.info(f"TP filled: {hit_side} order index {gCurrentIdx} (ID {oid}) closed. TP price: {hit_tp_price}")
+                            telegramBot.send_message(f"❤️ :: {order_comment} :: TP filled: Position ID {oid} closed | P&L: ${pnl:.2f} All Closed P&L: ${closed_pnl:.2f}", chat_id=TELEGRAM_CHAT_ID)
                             run_at_index(mt5_api, symbol, trade_amount, gCurrentIdx, price=0, logger=logger)
                             # delete gDetailOrders
                             logger.info(f"⚠️ :: Deleting gDetailOrders entry for {hit_side.lower()}_{hit_index}")
@@ -455,8 +504,9 @@ def main():
                     logger.info(f"All P&L: ${closed_pnl + open_pnl:.2f}")
                     logger.info(f"gCurrentIdx: {gCurrentIdx}")
                 
+
                 if closed_pnl + open_pnl > 10:
-                    logger.info(f"✅✅✅ Target profit reached. Closing all positions and cancelling all pending orders.")
+                    # Get current balance
                     close_all_positions(mt5_api, symbol, logger)
                     cancel_all_pending_orders(mt5_api, symbol, logger)
                     gDetailOrders = {key: {'status': None} for key in gDetailOrders.keys()}
@@ -464,6 +514,36 @@ def main():
                     notified_tp.clear()
                     closed_pnl = 0
                     gCurrentIdx = 0
+                    
+                    current_balance = None
+                    try:
+                        acc_info = mt5.get_account_info() if hasattr(mt5, 'get_account_info') else None
+                        if acc_info and hasattr(acc_info, 'balance'):
+                            current_balance = acc_info.balance
+                        else:
+                            acc_info_mt5 = mt5_api.account_info() if mt5_api else None
+                            if acc_info_mt5 and hasattr(acc_info_mt5, 'balance'):
+                                current_balance = acc_info_mt5.balance
+                    except Exception as e:
+                        logger.error(f"Error getting current balance: {e}")
+                    if current_balance is None:
+                        current_balance = 0
+
+                    # Calculate total pnl and run time
+                    total_pnl = current_balance - start_balance
+                    run_time = datetime.now() - script_start_time
+                    run_time_str = str(run_time).split('.')[0]  # Remove microseconds
+
+                    msg = (
+                        f"✅✅✅ Target profit reached.\n"
+                        f"Start balance: {start_balance}\n"
+                        f"Current balance: {current_balance}\n"
+                        f"Total PnL: {total_pnl}\n"
+                        f"Session PnL: {closed_pnl + open_pnl}\n"
+                        f"Run time: {run_time_str}"
+                    )
+                    logger.info(msg)
+                    telegramBot.send_message(msg, chat_id=TELEGRAM_CHAT_ID)
                     run_at_index(mt5_api, symbol, trade_amount, gCurrentIdx, price=0, logger=logger)
                     
                 time.sleep(0.5)

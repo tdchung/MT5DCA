@@ -1,8 +1,8 @@
 {
     "mt5": {
-        "login": 183585926,
+        "login": 159623800,
         "password": "zxCV!@#$1234",
-        "server": "Exness-MT5Real25",
+        "server": "Exness-MT5Real20",
         "timeout": 60000
     },
     "dca": {
