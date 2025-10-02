@@ -36,12 +36,12 @@ TELEGRAM_CHAT_ID = "1661018465"
 telegramBot = TelegramBot(TELEGRAM_API_TOKEN, TELEGRAM_BOT_NAME)
 
 ################################################################################################
-FIBONACCI_LEVELS = [1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89]
+FIBONACCI_LEVELS = [1, 1, 2, 3, 5, 8, 13, 21, 34]
 
 TRADE_SYMBOL = "XAUUSDc"
 # TRADE_SYMBOL = "XAUUSD"
-TRADE_AMOUNT = 0.01
-
+TRADE_AMOUNT = 0.07
+TP_EXPECTED    = 70
 DELTA_ENTER_PRICE = 0.3
 TARGET_PROFIT = 2.0
 
@@ -165,76 +165,78 @@ def place_pending_order(mt5_api, symbol, order_type, price, tp_price, volume=0.0
 
 def run_at_index(mt5_api, symbol, amount, index, price=0, logger=None):
     global gDetailOrders
-    # Get current price from MT5
-    tick = mt5_api.symbol_info_tick(symbol)
-    if not tick:
+    try:
+        # Get current price from MT5
+        tick = mt5_api.symbol_info_tick(symbol)
+        if not tick:
+            if logger:
+                logger.error(f"Could not get tick for {symbol}")
+            return
+
+        # price = tick.ask if tick.ask else tick.last
+        if not price:
+            price = (tick.bid + tick.ask) / 2
         if logger:
-            logger.error(f"Could not get tick for {symbol}")
-        return
+            logger.info(f"run_at_index: Current price for {symbol}: {price:.2f}")
 
-    # price = tick.ask if tick.ask else tick.last
-    if not price:
-        price = (tick.bid + tick.ask) / 2
-    if logger:
-        logger.info(f"run_at_index: Current price for {symbol}: {price:.2f}")
+        # Calculate buy stop entries and TP
+        buy_entry_1 = price + DELTA_ENTER_PRICE
+        buy_tp_1 = buy_entry_1 + TARGET_PROFIT
+        buy_entry_2 = price + TARGET_PROFIT + DELTA_ENTER_PRICE
+        buy_tp_2 = buy_entry_2 + TARGET_PROFIT
+        buy_entry_3 = price + 2 * TARGET_PROFIT + DELTA_ENTER_PRICE
+        buy_tp_3 = buy_entry_3 + TARGET_PROFIT
 
-    # Calculate buy stop entries and TP
-    buy_entry_1 = price + DELTA_ENTER_PRICE
-    buy_tp_1 = buy_entry_1 + TARGET_PROFIT
-    buy_entry_2 = price + TARGET_PROFIT + DELTA_ENTER_PRICE
-    buy_tp_2 = buy_entry_2 + TARGET_PROFIT
-    buy_entry_3 = price + 2 * TARGET_PROFIT + DELTA_ENTER_PRICE
-    buy_tp_3 = buy_entry_3 + TARGET_PROFIT
+        # Calculate sell stop entries and TP
+        sell_entry_1 = price - DELTA_ENTER_PRICE
+        sell_tp_1 = sell_entry_1 - TARGET_PROFIT
+        sell_entry_2 = price - TARGET_PROFIT - DELTA_ENTER_PRICE
+        sell_tp_2 = sell_entry_2 - TARGET_PROFIT
+        sell_entry_3 = price - 2 * TARGET_PROFIT - DELTA_ENTER_PRICE
+        sell_tp_3 = sell_entry_3 - TARGET_PROFIT
+            # Use trade amount scaled by FIBONACCI_LEVELS
+        fibb_amount_1 = amount * FIBONACCI_LEVELS[abs(index)]
+        fibb_amount_2 = amount * FIBONACCI_LEVELS[abs(index+1)] if abs(index+1) < len(FIBONACCI_LEVELS) else amount
+        fibb_amount_3 = amount * FIBONACCI_LEVELS[abs(index+2)] if abs(index+2) < len(FIBONACCI_LEVELS) else amount
 
-    # Calculate sell stop entries and TP
-    sell_entry_1 = price - DELTA_ENTER_PRICE
-    sell_tp_1 = sell_entry_1 - TARGET_PROFIT
-    sell_entry_2 = price - TARGET_PROFIT - DELTA_ENTER_PRICE
-    sell_tp_2 = sell_entry_2 - TARGET_PROFIT
-    sell_entry_3 = price - 2 * TARGET_PROFIT - DELTA_ENTER_PRICE
-    sell_tp_3 = sell_entry_3 - TARGET_PROFIT
-        # Use trade amount scaled by FIBONACCI_LEVELS
-    fibb_amount_1 = amount * FIBONACCI_LEVELS[abs(index)]
-    fibb_amount_2 = amount * FIBONACCI_LEVELS[abs(index+1)]
-    fibb_amount_3 = amount * FIBONACCI_LEVELS[abs(index+2)] if abs(index+2) < len(FIBONACCI_LEVELS) else amount
+        fibs_amount_1 = amount * FIBONACCI_LEVELS[abs(index)]
+        fibs_amount_2 = amount * FIBONACCI_LEVELS[abs(index-1)] if abs(index-1) < len(FIBONACCI_LEVELS) else amount
+        fibs_amount_3 = amount * FIBONACCI_LEVELS[abs(index-2)] if abs(index-2) < len(FIBONACCI_LEVELS) else amount
 
-    fibs_amount_1 = amount * FIBONACCI_LEVELS[abs(index)]
-    fibs_amount_2 = amount * FIBONACCI_LEVELS[abs(index-1)]
-    fibs_amount_3 = amount * FIBONACCI_LEVELS[abs(index-2)] if abs(index-2) < len(FIBONACCI_LEVELS) else amount
-
-    # Place buy stop orders only if not already placed
-    buy_comment_1 = f"buy_{index}"
-    buy_comment_2 = f"buy_{index+1}"
-    buy_comment_3 = f"buy_{index+2}"
-    # Place sell stop orders only if not already placed
-    sell_comment_1 = f"sell_{index}"
-    sell_comment_2 = f"sell_{index-1}"
-    sell_comment_3 = f"sell_{index-2}"
-    
-    if gDetailOrders.get(buy_comment_1, {}).get('status') != 'placed':
-        res_buy_1 = place_pending_order(mt5_api, symbol, mt5_api.ORDER_TYPE_BUY_STOP, buy_entry_1, buy_tp_1, fibb_amount_1, buy_comment_1, logger)
-        gDetailOrders[buy_comment_1] = {'status': 'placed', 'order': res_buy_1}
-    if gDetailOrders.get(sell_comment_1, {}).get('status') != 'placed':
-        res_sell_1 = place_pending_order(mt5_api, symbol, mt5_api.ORDER_TYPE_SELL_STOP, sell_entry_1, sell_tp_1, fibs_amount_1, sell_comment_1, logger)
-        gDetailOrders[sell_comment_1] = {'status': 'placed', 'order': res_sell_1}
+        # Place buy stop orders only if not already placed
+        buy_comment_1 = f"buy_{index}"
+        buy_comment_2 = f"buy_{index+1}"
+        buy_comment_3 = f"buy_{index+2}"
+        # Place sell stop orders only if not already placed
+        sell_comment_1 = f"sell_{index}"
+        sell_comment_2 = f"sell_{index-1}"
+        sell_comment_3 = f"sell_{index-2}"
         
-    if gDetailOrders.get(buy_comment_2, {}).get('status') != 'placed':
-        res_buy_2 = place_pending_order(mt5_api, symbol, mt5_api.ORDER_TYPE_BUY_STOP, buy_entry_2, buy_tp_2, fibb_amount_2, buy_comment_2, logger)
-        gDetailOrders[buy_comment_2] = {'status': 'placed', 'order': res_buy_2}
-    if gDetailOrders.get(sell_comment_2, {}).get('status') != 'placed':
-        res_sell_2 = place_pending_order(mt5_api, symbol, mt5_api.ORDER_TYPE_SELL_STOP, sell_entry_2, sell_tp_2, fibs_amount_2, sell_comment_2, logger)
-        gDetailOrders[sell_comment_2] = {'status': 'placed', 'order': res_sell_2}
-        
-    if gDetailOrders.get(buy_comment_3, {}).get('status') != 'placed':
-        res_buy_3 = place_pending_order(mt5_api, symbol, mt5_api.ORDER_TYPE_BUY_STOP, buy_entry_3, buy_tp_3, fibb_amount_3, buy_comment_3, logger)
-        gDetailOrders[buy_comment_3] = {'status': 'placed', 'order': res_buy_3}
-    if gDetailOrders.get(sell_comment_3, {}).get('status') != 'placed':
-        res_sell_3 = place_pending_order(mt5_api, symbol, mt5_api.ORDER_TYPE_SELL_STOP, sell_entry_3, sell_tp_3, fibs_amount_3, sell_comment_3, logger)
-        gDetailOrders[sell_comment_3] = {'status': 'placed', 'order': res_sell_3}
+        if gDetailOrders.get(buy_comment_1, {}).get('status') != 'placed':
+            res_buy_1 = place_pending_order(mt5_api, symbol, mt5_api.ORDER_TYPE_BUY_STOP, buy_entry_1, buy_tp_1, fibb_amount_1, buy_comment_1, logger)
+            gDetailOrders[buy_comment_1] = {'status': 'placed', 'order': res_buy_1}
+        if gDetailOrders.get(sell_comment_1, {}).get('status') != 'placed':
+            res_sell_1 = place_pending_order(mt5_api, symbol, mt5_api.ORDER_TYPE_SELL_STOP, sell_entry_1, sell_tp_1, fibs_amount_1, sell_comment_1, logger)
+            gDetailOrders[sell_comment_1] = {'status': 'placed', 'order': res_sell_1}
+            
+        if gDetailOrders.get(buy_comment_2, {}).get('status') != 'placed':
+            res_buy_2 = place_pending_order(mt5_api, symbol, mt5_api.ORDER_TYPE_BUY_STOP, buy_entry_2, buy_tp_2, fibb_amount_2, buy_comment_2, logger)
+            gDetailOrders[buy_comment_2] = {'status': 'placed', 'order': res_buy_2}
+        if gDetailOrders.get(sell_comment_2, {}).get('status') != 'placed':
+            res_sell_2 = place_pending_order(mt5_api, symbol, mt5_api.ORDER_TYPE_SELL_STOP, sell_entry_2, sell_tp_2, fibs_amount_2, sell_comment_2, logger)
+            gDetailOrders[sell_comment_2] = {'status': 'placed', 'order': res_sell_2}
+            
+        if gDetailOrders.get(buy_comment_3, {}).get('status') != 'placed':
+            res_buy_3 = place_pending_order(mt5_api, symbol, mt5_api.ORDER_TYPE_BUY_STOP, buy_entry_3, buy_tp_3, fibb_amount_3, buy_comment_3, logger)
+            gDetailOrders[buy_comment_3] = {'status': 'placed', 'order': res_buy_3}
+        if gDetailOrders.get(sell_comment_3, {}).get('status') != 'placed':
+            res_sell_3 = place_pending_order(mt5_api, symbol, mt5_api.ORDER_TYPE_SELL_STOP, sell_entry_3, sell_tp_3, fibs_amount_3, sell_comment_3, logger)
+            gDetailOrders[sell_comment_3] = {'status': 'placed', 'order': res_sell_3}
 
-    if logger:
-        logger.info(f"Grid orders placed for index {index}: buy/sell stops at {buy_entry_1:.2f}, {buy_entry_2:.2f}, {buy_entry_3:.2f}, {sell_entry_1:.2f}, {sell_entry_2:.2f}, {sell_entry_3:.2f}")
-
+        if logger:
+            logger.info(f"Grid orders placed for index {index}: buy/sell stops at {buy_entry_1:.2f}, {buy_entry_2:.2f}, {buy_entry_3:.2f}, {sell_entry_1:.2f}, {sell_entry_2:.2f}, {sell_entry_3:.2f}")
+    except Exception as e:
+        logger.error(f"ERORR :: {e}")
 
 def close_all_positions(mt5_api, symbol, logger=None):
     try:
@@ -260,8 +262,9 @@ def close_all_positions(mt5_api, symbol, logger=None):
                     logger.warning(f"Could not get ticket/volume/type for position: {pos}")
                 continue
             # Only close positions matching gDetailOrders
-            if ticket not in order_ids:
-                continue
+            # if ticket not in order_ids:
+            #     continue
+            
             # Determine close type
             if type_ == mt5_api.POSITION_TYPE_BUY:
                 close_type = mt5_api.ORDER_TYPE_SELL
@@ -328,8 +331,9 @@ def cancel_all_pending_orders(mt5_api, symbol, logger=None):
                     logger.warning(f"Could not get ticket for order: {order}")
                 continue
             # Only cancel pending orders matching gDetailOrders
-            if ticket not in order_ids:
-                continue
+            # if ticket not in order_ids:
+            #     continue
+            
             request = {
                 "action": mt5_api.TRADE_ACTION_REMOVE,
                 "order": ticket,
@@ -351,6 +355,17 @@ def cancel_all_pending_orders(mt5_api, symbol, logger=None):
     except Exception as e:
         if logger:
             logger.error(f"Error cancelling all pending orders: {e}")
+
+
+def get_current_balance(mt5_api, logger=None):
+    current_balance = 0
+    try:
+        acc_info_mt5 = mt5_api.account_info() if mt5_api else None
+        if acc_info_mt5 and hasattr(acc_info_mt5, 'balance'):
+            current_balance = acc_info_mt5.balance
+    except Exception as e:
+        logger.error(f"Error getting start balance: {e}")
+    return current_balance
 
 ###############################################################################################################
 def main():
@@ -380,20 +395,7 @@ def main():
         telegramBot.send_message(f"✅ Connected to Exness MT5 Account (Symbol: {symbol}, Trade Amount: {trade_amount})", chat_id=TELEGRAM_CHAT_ID)
         
         # Get start balance
-        start_balance = None
-        try:
-            acc_info = mt5.get_account_info() if hasattr(mt5, 'get_account_info') else None
-            if acc_info and hasattr(acc_info, 'balance'):
-                start_balance = acc_info.balance
-            else:
-                # fallback to MetaTrader5 API
-                acc_info_mt5 = mt5_api.account_info() if mt5_api else None
-                if acc_info_mt5 and hasattr(acc_info_mt5, 'balance'):
-                    start_balance = acc_info_mt5.balance
-        except Exception as e:
-            logger.error(f"Error getting start balance: {e}")
-        if start_balance is None:
-            start_balance = 0
+        start_balance = get_current_balance(mt5_api, logger=logger)
             
         # Step 1: Close all existing positions and pending orders for the symbol
         run_at_index(mt5_api, symbol, trade_amount, index=gCurrentIdx, price=0, logger=logger)
@@ -505,7 +507,7 @@ def main():
                     logger.info(f"gCurrentIdx: {gCurrentIdx}")
                 
 
-                if closed_pnl + open_pnl > 10:
+                if closed_pnl + open_pnl > TP_EXPECTED:
                     # Get current balance
                     close_all_positions(mt5_api, symbol, logger)
                     cancel_all_pending_orders(mt5_api, symbol, logger)
@@ -515,20 +517,8 @@ def main():
                     closed_pnl = 0
                     gCurrentIdx = 0
                     
-                    current_balance = None
-                    try:
-                        acc_info = mt5.get_account_info() if hasattr(mt5, 'get_account_info') else None
-                        if acc_info and hasattr(acc_info, 'balance'):
-                            current_balance = acc_info.balance
-                        else:
-                            acc_info_mt5 = mt5_api.account_info() if mt5_api else None
-                            if acc_info_mt5 and hasattr(acc_info_mt5, 'balance'):
-                                current_balance = acc_info_mt5.balance
-                    except Exception as e:
-                        logger.error(f"Error getting current balance: {e}")
-                    if current_balance is None:
-                        current_balance = 0
-
+                    current_balance = get_current_balance(mt5_api, logger=logger)
+                    
                     # Calculate total pnl and run time
                     total_pnl = current_balance - start_balance
                     run_time = datetime.now() - script_start_time
@@ -545,6 +535,13 @@ def main():
                     logger.info(msg)
                     telegramBot.send_message(msg, chat_id=TELEGRAM_CHAT_ID)
                     run_at_index(mt5_api, symbol, trade_amount, gCurrentIdx, price=0, logger=logger)
+                    
+                    notified_filled.clear()
+                    notified_tp.clear()
+                    closed_pnl = 0
+                    gCurrentIdx = 0
+                    script_start_time  = datetime.now()
+                    start_balance = get_current_balance(mt5_api, logger=logger)
                     
                 time.sleep(0.5)
         except KeyboardInterrupt:
