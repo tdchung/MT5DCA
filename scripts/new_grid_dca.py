@@ -158,13 +158,14 @@ def place_pending_order(mt5_api, symbol, order_type, price, tp_price, volume=0.0
         return None
     order_type_str = "BUY STOP" if order_type == mt5_api.ORDER_TYPE_BUY_STOP else "SELL STOP"
     if logger:
-        logger.info(f"✅ :: {comment} :: {order_type_str} order placed: {volume} lots at {price:.2f}, TP: {tp_price:.2f}")
+        # logger.info(f"✅ :: {comment} :: {order_type_str} order placed: {volume} lots at {price:.2f}, TP: {tp_price:.2f}")
         telegramBot.send_message(f"✅ :: {comment} :: {order_type_str} order placed: {volume} lots at {price:.2f}, TP: {tp_price:.2f}", chat_id=TELEGRAM_CHAT_ID)
     return result
 
 
 def run_at_index(mt5_api, symbol, amount, index, price=0, logger=None):
     global gDetailOrders
+
     try:
         # Get current price from MT5
         tick = mt5_api.symbol_info_tick(symbol)
@@ -194,7 +195,8 @@ def run_at_index(mt5_api, symbol, amount, index, price=0, logger=None):
         sell_tp_2 = sell_entry_2 - TARGET_PROFIT
         sell_entry_3 = price - 2 * TARGET_PROFIT - DELTA_ENTER_PRICE
         sell_tp_3 = sell_entry_3 - TARGET_PROFIT
-            # Use trade amount scaled by FIBONACCI_LEVELS
+
+        # Use trade amount scaled by FIBONACCI_LEVELS
         fibb_amount_1 = amount * FIBONACCI_LEVELS[abs(index)]
         fibb_amount_2 = amount * FIBONACCI_LEVELS[abs(index+1)] if abs(index+1) < len(FIBONACCI_LEVELS) else amount
         fibb_amount_3 = amount * FIBONACCI_LEVELS[abs(index+2)] if abs(index+2) < len(FIBONACCI_LEVELS) else amount
@@ -211,32 +213,81 @@ def run_at_index(mt5_api, symbol, amount, index, price=0, logger=None):
         sell_comment_1 = f"sell_{index}"
         sell_comment_2 = f"sell_{index-1}"
         sell_comment_3 = f"sell_{index-2}"
-        
+
+        new_orders = []
         if gDetailOrders.get(buy_comment_1, {}).get('status') != 'placed':
             res_buy_1 = place_pending_order(mt5_api, symbol, mt5_api.ORDER_TYPE_BUY_STOP, buy_entry_1, buy_tp_1, fibb_amount_1, buy_comment_1, logger)
-            gDetailOrders[buy_comment_1] = {'status': 'placed', 'order': res_buy_1}
+            if res_buy_1:
+                gDetailOrders[buy_comment_1] = {'status': 'placed', 'order': res_buy_1}
+                new_orders.append(res_buy_1)
         if gDetailOrders.get(sell_comment_1, {}).get('status') != 'placed':
             res_sell_1 = place_pending_order(mt5_api, symbol, mt5_api.ORDER_TYPE_SELL_STOP, sell_entry_1, sell_tp_1, fibs_amount_1, sell_comment_1, logger)
-            gDetailOrders[sell_comment_1] = {'status': 'placed', 'order': res_sell_1}
-            
+            if res_sell_1:
+                gDetailOrders[sell_comment_1] = {'status': 'placed', 'order': res_sell_1}
+                new_orders.append(res_sell_1)
+
         if gDetailOrders.get(buy_comment_2, {}).get('status') != 'placed':
             res_buy_2 = place_pending_order(mt5_api, symbol, mt5_api.ORDER_TYPE_BUY_STOP, buy_entry_2, buy_tp_2, fibb_amount_2, buy_comment_2, logger)
-            gDetailOrders[buy_comment_2] = {'status': 'placed', 'order': res_buy_2}
+            if res_buy_2:
+                gDetailOrders[buy_comment_2] = {'status': 'placed', 'order': res_buy_2}
+                new_orders.append(res_buy_2)
         if gDetailOrders.get(sell_comment_2, {}).get('status') != 'placed':
             res_sell_2 = place_pending_order(mt5_api, symbol, mt5_api.ORDER_TYPE_SELL_STOP, sell_entry_2, sell_tp_2, fibs_amount_2, sell_comment_2, logger)
-            gDetailOrders[sell_comment_2] = {'status': 'placed', 'order': res_sell_2}
-            
+            if res_sell_2:
+                gDetailOrders[sell_comment_2] = {'status': 'placed', 'order': res_sell_2}
+                new_orders.append(res_sell_2)
+
         if gDetailOrders.get(buy_comment_3, {}).get('status') != 'placed':
             res_buy_3 = place_pending_order(mt5_api, symbol, mt5_api.ORDER_TYPE_BUY_STOP, buy_entry_3, buy_tp_3, fibb_amount_3, buy_comment_3, logger)
-            gDetailOrders[buy_comment_3] = {'status': 'placed', 'order': res_buy_3}
+            if res_buy_3:
+                gDetailOrders[buy_comment_3] = {'status': 'placed', 'order': res_buy_3}
+                new_orders.append(res_buy_3)
         if gDetailOrders.get(sell_comment_3, {}).get('status') != 'placed':
             res_sell_3 = place_pending_order(mt5_api, symbol, mt5_api.ORDER_TYPE_SELL_STOP, sell_entry_3, sell_tp_3, fibs_amount_3, sell_comment_3, logger)
-            gDetailOrders[sell_comment_3] = {'status': 'placed', 'order': res_sell_3}
+            if res_sell_3:
+                gDetailOrders[sell_comment_3] = {'status': 'placed', 'order': res_sell_3}
+                new_orders.append(res_sell_3)
 
-        if logger:
-            logger.info(f"Grid orders placed for index {index}: buy/sell stops at {buy_entry_1:.2f}, {buy_entry_2:.2f}, {buy_entry_3:.2f}, {sell_entry_1:.2f}, {sell_entry_2:.2f}, {sell_entry_3:.2f}")
+        # Show order status list
+        def get_order_status_str(key, val):
+            order_obj = val.get('order')
+            status = val.get('status')
+            filled = False
+            order_id = None
+            price = None
+            if order_obj:
+                order_id = getattr(order_obj, 'order', None)
+                price = getattr(order_obj.request, 'price', None)
+            # Check if filled (notified_filled is global in main, but here we only know 'placed')
+            if status == 'placed':
+                status_str = '✔️'
+            elif status == 'filled':
+                status_str = '✅'
+            else:
+                status_str = '❔'
+            side, idx = key.split('_')
+            side_str = 'Buy' if side == 'buy' else 'Sell'
+            idx_str = idx
+            return f"{{status: {status_str}}} {side_str} {idx_str}: {price if price is not None else '-'} {order_id if order_id is not None else '-'}"
+
+
+        # Show all keys in gDetailOrders
+        if len(new_orders) > 0:
+            telegramBot.send_message(f"New Orders Placed:\n" + '\n'.join([get_order_status_str(k, gDetailOrders[k]) for k in sorted(gDetailOrders.keys()) if gDetailOrders[k].get('order') in new_orders]), chat_id=TELEGRAM_CHAT_ID)
+            all_order_status_lines = []
+            for key in sorted(gDetailOrders.keys(), key=lambda x: (x.split('_')[0], int(x.split('_')[1]))):
+                val = gDetailOrders.get(key, {})
+                all_order_status_lines.append(get_order_status_str(key, val))
+            all_status_report = '\n'.join(all_order_status_lines)
+            if logger:
+                logger.info(f"All Order Status List:\n{all_status_report}")
+            # Send to Telegram
+            telegramBot.send_message(f"All Order Status List:\n{all_status_report}", chat_id=TELEGRAM_CHAT_ID)
+
+            if logger:
+                logger.info(f"Grid orders placed for index {index}: buy/sell stops at {buy_entry_1:.2f}, {buy_entry_2:.2f}, {buy_entry_3:.2f}, {sell_entry_1:.2f}, {sell_entry_2:.2f}, {sell_entry_3:.2f}")
     except Exception as e:
-        logger.error(f"ERORR :: {e}")
+        logger.error(f"ERROR :: {e}")
 
 def close_all_positions(mt5_api, symbol, logger=None):
     try:
@@ -494,7 +545,7 @@ def main():
                             logger.info(f"❤️ :: {order_comment} :: TP filled: Position ID {oid} closed | P&L: ${pnl:.2f} All Closed P&L: ${closed_pnl:.2f}")
                             logger.info(f"TP filled order IDs: {notified_tp}")
                             logger.info(f"TP filled: {hit_side} order index {gCurrentIdx} (ID {oid}) closed. TP price: {hit_tp_price}")
-                            telegramBot.send_message(f"❤️ :: {order_comment} :: TP filled: Position ID {oid} closed | P&L: ${pnl:.2f} All Closed P&L: ${closed_pnl:.2f}", chat_id=TELEGRAM_CHAT_ID)
+                            telegramBot.send_message(f"❤️❤️❤️ :: {order_comment} :: TP filled: Position ID {oid} closed \nP&L: ${pnl:.2f}\n All Closed P&L: ${closed_pnl:.2f} \nAll P&L: ${closed_pnl + open_pnl:.2f}", chat_id=TELEGRAM_CHAT_ID)
                             run_at_index(mt5_api, symbol, trade_amount, gCurrentIdx, price=0, logger=logger)
                             # delete gDetailOrders
                             logger.info(f"⚠️ :: Deleting gDetailOrders entry for {hit_side.lower()}_{hit_index}")
@@ -525,17 +576,28 @@ def main():
                     run_time_str = str(run_time).split('.')[0]  # Remove microseconds
 
                     msg = (
-                        f"✅✅✅ Target profit reached.\n"
+                        f"✅✅✅✅✅ Target profit reached.\n"
                         f"Start balance: {start_balance}\n"
                         f"Current balance: {current_balance}\n"
                         f"Total PnL: {total_pnl}\n"
                         f"Session PnL: {closed_pnl + open_pnl}\n"
                         f"Run time: {run_time_str}"
                     )
+
                     logger.info(msg)
                     telegramBot.send_message(msg, chat_id=TELEGRAM_CHAT_ID)
+
+                    # Check if any open positions or open orders remain
+                    positions_left = mt5.get_positions()
+                    open_orders_left = mt5_api.orders_get(symbol=symbol)
+                    if positions_left:
+                        logger.warning(f"⚠️ Open positions remain after TP: {positions_left}")
+                        telegramBot.send_message(f"⚠️ Open positions remain after TP: {positions_left}", chat_id=TELEGRAM_CHAT_ID)
+                    if open_orders_left:
+                        logger.warning(f"⚠️ Open orders remain after TP: {open_orders_left}")
+                        telegramBot.send_message(f"⚠️ Open orders remain after TP: {open_orders_left}", chat_id=TELEGRAM_CHAT_ID)
+
                     run_at_index(mt5_api, symbol, trade_amount, gCurrentIdx, price=0, logger=logger)
-                    
                     notified_filled.clear()
                     notified_tp.clear()
                     closed_pnl = 0
