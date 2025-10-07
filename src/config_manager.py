@@ -126,7 +126,8 @@ class ConfigManager:
         return {
             'login': self.get('mt5.login'),
             'password': self.get('mt5.password'),
-            'server': self.get('mt5.server')
+            'server': self.get('mt5.server'),
+            'path': self.get('mt5.path')
         }
     
     def get_dca_settings(self) -> Dict[str, Any]:

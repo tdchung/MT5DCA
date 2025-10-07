@@ -3,6 +3,7 @@ MetaTrader 5 (MT5) integration module for DCA1 project.
 Provides connection, data retrieval, and trading capabilities.
 """
 
+from os import path
 import MetaTrader5 as mt5
 import pandas as pd
 import numpy as np
@@ -19,8 +20,13 @@ class MT5Connection:
     and execute trades for the DCA strategy.
     """
     
-    def __init__(self, login: Optional[int] = None, password: Optional[str] = None, 
-                 server: Optional[str] = None):
+    def __init__(
+        self,
+        login: Optional[int] = None,
+        password: Optional[str] = None,
+        server: Optional[str] = None,
+        path: Optional[str] = None,
+        ):
         """
         Initialize MT5 connection.
         
@@ -32,7 +38,10 @@ class MT5Connection:
         self.login = login
         self.password = password
         self.server = server
+        self.path = path
+        # self.path = "D:\\MT5\\MT5\\terminal64.exe"
         self.connected = False
+        self.mt5 = mt5
         self.logger = logging.getLogger(__name__)
     
     def connect(self) -> bool:
@@ -44,14 +53,18 @@ class MT5Connection:
         """
         try:
             # Initialize MT5 connection
-            if not mt5.initialize():
-                self.logger.error(f"initialize() failed, error code = {mt5.last_error()}")
-                return False
-            
+            if path:
+                if not self.mt5.initialize(path=self.path):
+                    self.logger.error(f"initialize() failed, error code = {self.mt5.last_error()}")
+                    return False
+            else:
+                if not self.mt5.initialize():
+                    self.logger.error(f"initialize() failed, error code = {self.mt5.last_error()}")
+                    return False
             # Login if credentials provided
             if self.login and self.password and self.server:
-                if not mt5.login(self.login, password=self.password, server=self.server):
-                    self.logger.error(f"login() failed, error code = {mt5.last_error()}")
+                if not self.mt5.login(self.login, password=self.password, server=self.server):
+                    self.logger.error(f"login() failed, error code = {self.mt5.last_error()}")
                     return False
                 self.logger.info(f"Connected to MT5 account: {self.login}")
             else:
@@ -60,8 +73,8 @@ class MT5Connection:
             self.connected = True
             
             # Display connection info
-            terminal_info = mt5.terminal_info()
-            account_info = mt5.account_info()
+            terminal_info = self.mt5.terminal_info()
+            account_info = self.mt5.account_info()
             
             if terminal_info:
                 self.logger.info(f"MT5 Terminal: {terminal_info.name} {terminal_info.build}")
@@ -78,7 +91,7 @@ class MT5Connection:
     def disconnect(self) -> None:
         """Disconnect from MT5 terminal."""
         if self.connected:
-            mt5.shutdown()
+            self.mt5.shutdown()
             self.connected = False
             self.logger.info("Disconnected from MT5")
     
@@ -96,7 +109,7 @@ class MT5Connection:
             self.logger.error("Not connected to MT5")
             return None
         
-        symbol_info = mt5.symbol_info(symbol)
+        symbol_info = self.mt5.symbol_info(symbol)
         if symbol_info is None:
             self.logger.error(f"Symbol {symbol} not found")
             return None
@@ -145,7 +158,7 @@ class MT5Connection:
             return None
         
         try:
-            rates = mt5.copy_rates_range(symbol, timeframe, start_date, end_date)
+            rates = self.mt5.copy_rates_range(symbol, timeframe, start_date, end_date)
             if rates is None or len(rates) == 0:
                 self.logger.error(f"No historical data for {symbol}")
                 return None
@@ -180,20 +193,20 @@ class MT5Connection:
             return None
         
         # Get symbol info for price
-        symbol_info = mt5.symbol_info(symbol)
+        symbol_info = self.mt5.symbol_info(symbol)
         if symbol_info is None:
             self.logger.error(f"Symbol {symbol} not found")
             return None
         
         # Determine price based on order type
-        if order_type == mt5.ORDER_TYPE_BUY:
+        if order_type == self.mt5.ORDER_TYPE_BUY:
             price = symbol_info.ask
         else:
             price = symbol_info.bid
         
         # Prepare order request
         request = {
-            "action": mt5.TRADE_ACTION_DEAL,
+            "action": self.mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
             "volume": volume,
             "type": order_type,
@@ -201,18 +214,18 @@ class MT5Connection:
             "deviation": 20,
             "magic": 234000,
             "comment": comment,
-            "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
+            "type_time": self.mt5.ORDER_TIME_GTC,
+            "type_filling": self.mt5.ORDER_FILLING_IOC,
         }
         
         # Send order
         try:
-            result = mt5.order_send(request)
+            result = self.mt5.order_send(request)
             if result is None:
-                self.logger.error(f"Order send failed, error: {mt5.last_error()}")
+                self.logger.error(f"Order send failed, error: {self.mt5.last_error()}")
                 return None
             
-            if result.retcode != mt5.TRADE_RETCODE_DONE:
+            if result.retcode != self.mt5.TRADE_RETCODE_DONE:
                 self.logger.error(f"Order failed, retcode: {result.retcode}")
                 return None
             
@@ -241,7 +254,7 @@ class MT5Connection:
             self.logger.error("Not connected to MT5")
             return []
         
-        positions = mt5.positions_get()
+        positions = self.mt5.positions_get()
         if positions is None:
             return []
         

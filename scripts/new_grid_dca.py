@@ -17,12 +17,6 @@ from config_manager import ConfigManager
 
 from Libs.telegramBot import TelegramBot
 
-try:
-    import MetaTrader5 as mt5_api
-except ImportError:
-    print("MetaTrader5 not available - using mock")
-    mt5_api = None
-
 src_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src'))
 if src_path not in sys.path:
     sys.path.insert(0, src_path)
@@ -38,12 +32,17 @@ telegramBot = TelegramBot(TELEGRAM_API_TOKEN, TELEGRAM_BOT_NAME)
 ################################################################################################
 FIBONACCI_LEVELS = [1, 1, 2, 3, 5, 8, 13, 21, 34]
 
+CONFIG_FILE = f"config/mt5_config.json"
+
 TRADE_SYMBOL = "XAUUSDc"
 # TRADE_SYMBOL = "XAUUSD"
-TRADE_AMOUNT = 0.07
-TP_EXPECTED    = 70
 DELTA_ENTER_PRICE = 0.3
 TARGET_PROFIT = 2.0
+TRADE_AMOUNT = 0.03
+TP_EXPECTED    = 30
+MAX_REDUCE_BALANCE = 600  # Max balance reduction before stopping the script
+
+MIN_FREE_MARGIN = 1000  # Minimum free margin to continue trading
 
 gDetailOrders = {
     'buy_9': {'status': None},
@@ -86,6 +85,7 @@ gDetailOrders = {
     'sell_-9': {'status': None},
 }
 gCurrentIdx = 0
+gStartBalance = 0
 
 ################################################################################################
 def check_pending_order_filled(history, order_id, logger=None):
@@ -123,8 +123,40 @@ def pos_closed_pnl(mt5_api, position_id, logger=None):
     except Exception as e:
         if logger: logger.error(f"ERORR :: pos_closed_pnl :: {e}")
     return pnl
-    
-    
+
+def get_current_balance(mt5_api, logger=None):
+    current_balance = 0
+    try:
+        acc_info_mt5 = mt5_api.account_info() if mt5_api else None
+        if logger: logger.info(f"DEBUG :: acc_info_mt5 {acc_info_mt5}")
+        if acc_info_mt5 and hasattr(acc_info_mt5, 'balance'):
+            current_balance = acc_info_mt5.balance
+    except Exception as e:
+        logger.error(f"Error getting start balance: {e}")
+    return current_balance
+
+def get_current_equity(mt5_api, logger=None):
+    current_equity = 0
+    try:
+        acc_info_mt5 = mt5_api.account_info() if mt5_api else None
+        if logger: logger.info(f"DEBUG :: acc_info_mt5 {acc_info_mt5}")
+        if acc_info_mt5 and hasattr(acc_info_mt5, 'equity'):
+            current_equity = acc_info_mt5.equity
+    except Exception as e:
+        logger.error(f"Error getting current equity: {e}")
+    return current_equity
+
+def get_current_free_margin(mt5_api, logger=None):
+    current_free_margin = 0
+    try:
+        acc_info_mt5 = mt5_api.account_info() if mt5_api else None
+        if logger: logger.info(f"DEBUG :: acc_info_mt5 {acc_info_mt5}")
+        if acc_info_mt5 and hasattr(acc_info_mt5, 'margin_free'):
+            current_free_margin = acc_info_mt5.margin_free
+    except Exception as e:
+        logger.error(f"Error getting current free margin: {e}")
+    return current_free_margin
+
 ###############################################################################################################
 def place_pending_order(mt5_api, symbol, order_type, price, tp_price, volume=0.01, comment="", logger=None):
     existing_orders = mt5_api.orders_get(symbol=symbol)
@@ -154,19 +186,35 @@ def place_pending_order(mt5_api, symbol, order_type, price, tp_price, volume=0.0
     if result.retcode != mt5_api.TRADE_RETCODE_DONE:
         if logger:
             logger.error(f"⭕️ :: {comment} :: Order failed, retcode: {result.retcode}, comment: {result.comment}")
-            telegramBot.send_message(f"⭕️ :: {comment} :: Order failed, retcode: {result.retcode}, comment: {result.comment}", chat_id=TELEGRAM_CHAT_ID)
+            # telegramBot.send_message(f"⭕️ :: {comment} :: Order failed, retcode: {result.retcode}, comment: {result.comment}", chat_id=TELEGRAM_CHAT_ID)
         return None
     order_type_str = "BUY STOP" if order_type == mt5_api.ORDER_TYPE_BUY_STOP else "SELL STOP"
     if logger:
-        # logger.info(f"✅ :: {comment} :: {order_type_str} order placed: {volume} lots at {price:.2f}, TP: {tp_price:.2f}")
-        telegramBot.send_message(f"✅ :: {comment} :: {order_type_str} order placed: {volume} lots at {price:.2f}, TP: {tp_price:.2f}", chat_id=TELEGRAM_CHAT_ID)
+        logger.info(f"✅ :: {comment} :: {order_type_str} order placed: {volume} lots at {price:.2f}, TP: {tp_price:.2f}")
+        # telegramBot.send_message(f"✅ :: {comment} :: {order_type_str} order placed: {volume} lots at {price:.2f}, TP: {tp_price:.2f}", chat_id=TELEGRAM_CHAT_ID)
     return result
 
 
 def run_at_index(mt5_api, symbol, amount, index, price=0, logger=None):
     global gDetailOrders
+    global gStartBalance
 
     try:
+        current_balance = get_current_balance(mt5_api, logger=logger)
+        current_equity = get_current_equity(mt5_api, logger=logger)
+        current_fee_margin = get_current_free_margin(mt5_api, logger=logger)
+        if current_equity < gStartBalance - MAX_REDUCE_BALANCE:
+            if logger:
+                logger.error(f"⛔️ Current equity {current_equity} has reduced more than {MAX_REDUCE_BALANCE} from start balance {gStartBalance}. Stopping further trades.")
+            telegramBot.send_message(f"⛔️ Current equity {current_equity} has reduced more than {MAX_REDUCE_BALANCE} from start balance {gStartBalance}. Stopping further trades.", chat_id=TELEGRAM_CHAT_ID)
+            return
+        
+        if current_fee_margin < MIN_FREE_MARGIN:
+            if logger:
+                logger.error(f"⛔️ Current free margin {current_fee_margin} is below minimum required {MIN_FREE_MARGIN}. Stopping further trades.")
+            telegramBot.send_message(f"⛔️ Current free margin {current_fee_margin} is below minimum required {MIN_FREE_MARGIN}. Stopping further trades.", chat_id=TELEGRAM_CHAT_ID)
+            return
+        
         # Get current price from MT5
         tick = mt5_api.symbol_info_tick(symbol)
         if not tick:
@@ -258,6 +306,7 @@ def run_at_index(mt5_api, symbol, amount, index, price=0, logger=None):
             if order_obj:
                 order_id = getattr(order_obj, 'order', None)
                 price = getattr(order_obj.request, 'price', None)
+                price = round(price, 3) if price is not None else None
             # Check if filled (notified_filled is global in main, but here we only know 'placed')
             if status == 'placed':
                 status_str = '✔️'
@@ -274,10 +323,23 @@ def run_at_index(mt5_api, symbol, amount, index, price=0, logger=None):
         # Show all keys in gDetailOrders
         if len(new_orders) > 0:
             telegramBot.send_message(f"New Orders Placed:\n" + '\n'.join([get_order_status_str(k, gDetailOrders[k]) for k in sorted(gDetailOrders.keys()) if gDetailOrders[k].get('order') in new_orders]), chat_id=TELEGRAM_CHAT_ID)
+
+            # Sort keys: buys descending, sells ascending
+            def order_sort_key(x):
+                side, idx = x.split('_')
+                idx = int(idx)
+                # if side == 'buy':
+                #     return (0, -idx)
+                # else:
+                # return (1, idx)
+                return (0, idx)
+
+            sorted_keys = sorted(gDetailOrders.keys(), key=order_sort_key)
             all_order_status_lines = []
-            for key in sorted(gDetailOrders.keys(), key=lambda x: (x.split('_')[0], int(x.split('_')[1]))):
+            for key in sorted_keys:
                 val = gDetailOrders.get(key, {})
-                all_order_status_lines.append(get_order_status_str(key, val))
+                if val and val.get('order') is not None:
+                    all_order_status_lines.append(get_order_status_str(key, val))
             all_status_report = '\n'.join(all_order_status_lines)
             if logger:
                 logger.info(f"All Order Status List:\n{all_status_report}")
@@ -408,19 +470,11 @@ def cancel_all_pending_orders(mt5_api, symbol, logger=None):
             logger.error(f"Error cancelling all pending orders: {e}")
 
 
-def get_current_balance(mt5_api, logger=None):
-    current_balance = 0
-    try:
-        acc_info_mt5 = mt5_api.account_info() if mt5_api else None
-        if acc_info_mt5 and hasattr(acc_info_mt5, 'balance'):
-            current_balance = acc_info_mt5.balance
-    except Exception as e:
-        logger.error(f"Error getting start balance: {e}")
-    return current_balance
 
 ###############################################################################################################
 def main():
     global gDetailOrders, gCurrentIdx
+    global gStartBalance
     
     logging.basicConfig(
         level=logging.INFO,
@@ -430,14 +484,15 @@ def main():
     logger.info("=== New Grid DCA Strategy for XAUUSD ===")
     script_start_time = datetime.now()
     try:
-        config = ConfigManager()
+        config = ConfigManager(CONFIG_FILE)
         credentials = config.get_mt5_credentials()
         symbol = TRADE_SYMBOL
         trade_amount = TRADE_AMOUNT
         mt5 = MT5Connection(
             login=credentials['login'],
             password=credentials['password'],
-            server=credentials['server']
+            server=credentials['server'],
+            path=credentials['path'],
         )
         if not mt5.connect():
             logger.error("❌ Failed to connect to MT5")
@@ -446,10 +501,11 @@ def main():
         telegramBot.send_message(f"✅ Connected to Exness MT5 Account (Symbol: {symbol}, Trade Amount: {trade_amount})", chat_id=TELEGRAM_CHAT_ID)
         
         # Get start balance
-        start_balance = get_current_balance(mt5_api, logger=logger)
+        start_balance = get_current_balance(mt5.mt5, logger=logger)
+        gStartBalance = start_balance
             
         # Step 1: Close all existing positions and pending orders for the symbol
-        run_at_index(mt5_api, symbol, trade_amount, index=gCurrentIdx, price=0, logger=logger)
+        run_at_index(mt5.mt5, symbol, trade_amount, index=gCurrentIdx, price=0, logger=logger)
         
         notified_filled = set()
         notified_tp = set()
@@ -475,7 +531,7 @@ def main():
                 # Check closed positions for TP filled
                 history = []
                 now = datetime.now()
-                history = mt5_api.history_deals_get(script_start_time, now)
+                history = mt5.mt5.history_deals_get(script_start_time, now)
                 
                 # check if Pending order filled
                 for oid in saved_orders:
@@ -503,13 +559,13 @@ def main():
                             notified_filled.add(oid)
                             logger.info(f"Filled order IDs: {notified_filled}")
                             telegramBot.send_message(f"🔥 :: {order_comment} :: Pending order filled: ID {oid} | {side} | {order_price}", chat_id=TELEGRAM_CHAT_ID  )
-                            run_at_index(mt5_api, symbol, trade_amount, gCurrentIdx, price=order_price, logger=logger)
+                            run_at_index(mt5.mt5, symbol, trade_amount, gCurrentIdx, price=order_price, logger=logger)
                         
                 # check if Position closed (TP filled)
                 for oid in notified_filled:
                     if oid not in notified_tp:
-                        if check_position_closed(mt5_api, oid, logger):
-                            pnl = pos_closed_pnl(mt5_api, oid, logger)
+                        if check_position_closed(mt5.mt5, oid, logger):
+                            pnl = pos_closed_pnl(mt5.mt5, oid, logger)
                             closed_pnl += pnl
                             notified_tp.add(oid)
                             hit_index = None
@@ -546,7 +602,7 @@ def main():
                             logger.info(f"TP filled order IDs: {notified_tp}")
                             logger.info(f"TP filled: {hit_side} order index {gCurrentIdx} (ID {oid}) closed. TP price: {hit_tp_price}")
                             telegramBot.send_message(f"❤️❤️❤️ :: {order_comment} :: TP filled: Position ID {oid} closed \nP&L: ${pnl:.2f}\n All Closed P&L: ${closed_pnl:.2f} \nAll P&L: ${closed_pnl + open_pnl:.2f}", chat_id=TELEGRAM_CHAT_ID)
-                            run_at_index(mt5_api, symbol, trade_amount, gCurrentIdx, price=0, logger=logger)
+                            run_at_index(mt5.mt5, symbol, trade_amount, gCurrentIdx, price=0, logger=logger)
                             # delete gDetailOrders
                             logger.info(f"⚠️ :: Deleting gDetailOrders entry for {hit_side.lower()}_{hit_index}")
                             gDetailOrders[f"{hit_side.lower()}_{hit_index}"] = {'status': None}
@@ -560,15 +616,15 @@ def main():
 
                 if closed_pnl + open_pnl > TP_EXPECTED:
                     # Get current balance
-                    close_all_positions(mt5_api, symbol, logger)
-                    cancel_all_pending_orders(mt5_api, symbol, logger)
+                    close_all_positions(mt5.mt5, symbol, logger)
+                    cancel_all_pending_orders(mt5.mt5, symbol, logger)
                     gDetailOrders = {key: {'status': None} for key in gDetailOrders.keys()}
                     notified_filled.clear()
                     notified_tp.clear()
                     closed_pnl = 0
                     gCurrentIdx = 0
                     
-                    current_balance = get_current_balance(mt5_api, logger=logger)
+                    current_balance = get_current_balance(mt5.mt5, logger=logger)
                     
                     # Calculate total pnl and run time
                     total_pnl = current_balance - start_balance
@@ -589,7 +645,7 @@ def main():
 
                     # Check if any open positions or open orders remain
                     positions_left = mt5.get_positions()
-                    open_orders_left = mt5_api.orders_get(symbol=symbol)
+                    open_orders_left = mt5.mt5.orders_get(symbol=symbol)
                     if positions_left:
                         logger.warning(f"⚠️ Open positions remain after TP: {positions_left}")
                         telegramBot.send_message(f"⚠️ Open positions remain after TP: {positions_left}", chat_id=TELEGRAM_CHAT_ID)
@@ -597,13 +653,14 @@ def main():
                         logger.warning(f"⚠️ Open orders remain after TP: {open_orders_left}")
                         telegramBot.send_message(f"⚠️ Open orders remain after TP: {open_orders_left}", chat_id=TELEGRAM_CHAT_ID)
 
-                    run_at_index(mt5_api, symbol, trade_amount, gCurrentIdx, price=0, logger=logger)
+                    run_at_index(mt5.mt5, symbol, trade_amount, gCurrentIdx, price=0, logger=logger)
                     notified_filled.clear()
                     notified_tp.clear()
                     closed_pnl = 0
                     gCurrentIdx = 0
                     script_start_time  = datetime.now()
-                    start_balance = get_current_balance(mt5_api, logger=logger)
+                    start_balance = get_current_balance(mt5.mt5, logger=logger)
+                    gStartBalance = start_balance
                     
                 time.sleep(0.5)
         except KeyboardInterrupt:

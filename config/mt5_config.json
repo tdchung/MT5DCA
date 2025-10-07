@@ -3,7 +3,8 @@
         "login": 183585926,
         "password": "zxCV!@#$1234",
         "server": "Exness-MT5Real25",
-        "timeout": 60000
+        "timeout": 60000,
+        "path": "C:\\Program Files\\MetaTrader 5\\terminal64.exe"
     },
     "dca": {
         "investment_amount": 1000.0,
