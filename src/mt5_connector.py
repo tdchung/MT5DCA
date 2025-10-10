@@ -53,6 +53,7 @@ class MT5Connection:
         """
         try:
             # Initialize MT5 connection
+            print(f"PATH: {self.path}")
             if path:
                 if not self.mt5.initialize(path=self.path):
                     self.logger.error(f"initialize() failed, error code = {self.mt5.last_error()}")

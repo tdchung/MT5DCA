@@ -4,7 +4,7 @@
         "password": "zxCV!@#$1234",
         "server": "Exness-MT5Real20",
         "timeout": 60000,
-        "path": "C:\\Program Files\\MetaTrader 5\\terminal64.exe"
+        "path": "C:\\MT5\\MT51\\terminal64.exe"
     },
     "dca": {
         "investment_amount": 1000.0,

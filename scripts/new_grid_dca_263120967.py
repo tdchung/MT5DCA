@@ -23,26 +23,26 @@ if src_path not in sys.path:
 
 
 ################################################################################################
-TELEGRAM_API_TOKEN = f"7763641173:AAFSk2MUmsbU21BvVKXiV4g4dMEXuWBGo-M"
+TELEGRAM_API_TOKEN = f"5726946410:AAHA7N2q8bQYCUcYMeEtQd1w74a77IdOnC0"
 TELEGRAM_BOT_NAME = "@tdc_main_gold_bot"
 TELEGRAM_CHAT_ID = "1661018465"
 
 telegramBot = TelegramBot(TELEGRAM_API_TOKEN, TELEGRAM_BOT_NAME)
 
 ################################################################################################
-FIBONACCI_LEVELS = [1, 1, 2, 2, 3, 3, 5, 8, 13, 21]
+# FIBONACCI_LEVELS = [1, 1, 2, 3, 5, 8, 13, 21, 34]
+FIBONACCI_LEVELS = [1, 1, 2, 2, 3, 5, 8, 13, 21]
 
-CONFIG_FILE = f"config/mt5_config.json"
+CONFIG_FILE = f"config/mt5_config_263120967.json"
 
 TRADE_SYMBOL = "XAUUSDc"
 # TRADE_SYMBOL = "XAUUSD"
-DELTA_ENTER_PRICE = 0.3
-TARGET_PROFIT = 2.0
-TRADE_AMOUNT = 0.03
-TP_EXPECTED    = 30
-MAX_REDUCE_BALANCE = 450  # Max balance reduction before stopping the script
-
-MIN_FREE_MARGIN = 1000  # Minimum free margin to continue trading
+DELTA_ENTER_PRICE = 0.4
+TARGET_PROFIT = 2.5
+TRADE_AMOUNT = 0.1
+TP_EXPECTED    = 100
+MAX_REDUCE_BALANCE = 1800  # Max balance reduction before stopping the script
+MIN_FREE_MARGIN = 4000  # Minimum free margin to continue trading
 
 gDetailOrders = {
     'buy_9': {'status': None},
@@ -500,6 +500,8 @@ def main():
         logger.info(f"✅ Connected to Exness MT5 Account (Symbol: {symbol}, Trade Amount: {trade_amount})")
         telegramBot.send_message(f"✅ Connected to Exness MT5 Account (Symbol: {symbol}, Trade Amount: {trade_amount})", chat_id=TELEGRAM_CHAT_ID)
         
+        # return
+
         # Get start balance
         start_balance = get_current_balance(mt5.mt5, logger=logger)
         gStartBalance = start_balance
@@ -641,7 +643,7 @@ def main():
                     )
 
                     logger.info(msg)
-                    telegramBot.send_message(msg, chat_id=TELEGRAM_CHAT_ID)
+                    telegramBot.send_message(msg, chat_id=TELEGRAM_CHAT_ID, pin_msg=True)
 
                     # Check if any open positions or open orders remain
                     positions_left = mt5.get_positions()
@@ -649,6 +651,7 @@ def main():
                     if positions_left:
                         logger.warning(f"⚠️ Open positions remain after TP: {positions_left}")
                         telegramBot.send_message(f"⚠️ Open positions remain after TP: {positions_left}", chat_id=TELEGRAM_CHAT_ID)
+                        close_all_positions(mt5.mt5, symbol, logger)
                     if open_orders_left:
                         logger.warning(f"⚠️ Open orders remain after TP: {open_orders_left}")
                         telegramBot.send_message(f"⚠️ Open orders remain after TP: {open_orders_left}", chat_id=TELEGRAM_CHAT_ID)

@@ -32,16 +32,15 @@ telegramBot = TelegramBot(TELEGRAM_API_TOKEN, TELEGRAM_BOT_NAME)
 ################################################################################################
 FIBONACCI_LEVELS = [1, 1, 2, 2, 3, 3, 5, 8, 13, 21]
 
-CONFIG_FILE = f"config/mt5_config.json"
+CONFIG_FILE = f"config/mt5_config_183585926.json"
 
 TRADE_SYMBOL = "XAUUSDc"
 # TRADE_SYMBOL = "XAUUSD"
-DELTA_ENTER_PRICE = 0.3
+DELTA_ENTER_PRICE = 0.8
 TARGET_PROFIT = 2.0
 TRADE_AMOUNT = 0.03
-TP_EXPECTED    = 30
-MAX_REDUCE_BALANCE = 450  # Max balance reduction before stopping the script
-
+TP_EXPECTED    = 80
+MAX_REDUCE_BALANCE = 2000  # Max balance reduction before stopping the script
 MIN_FREE_MARGIN = 1000  # Minimum free margin to continue trading
 
 gDetailOrders = {
@@ -649,6 +648,7 @@ def main():
                     if positions_left:
                         logger.warning(f"⚠️ Open positions remain after TP: {positions_left}")
                         telegramBot.send_message(f"⚠️ Open positions remain after TP: {positions_left}", chat_id=TELEGRAM_CHAT_ID)
+                        close_all_positions(mt5.mt5, symbol, logger)
                     if open_orders_left:
                         logger.warning(f"⚠️ Open orders remain after TP: {open_orders_left}")
                         telegramBot.send_message(f"⚠️ Open orders remain after TP: {open_orders_left}", chat_id=TELEGRAM_CHAT_ID)

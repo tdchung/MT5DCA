@@ -28,7 +28,7 @@ class TelegramBot:
 
         self.bot = Bot(token=self.token)
         
-    def send_message(self, msg, chat_id=None, symbol=None, reply_to_message_id=None):
+    def send_message(self, msg, chat_id=None, symbol=None, reply_to_message_id=None, pin_msg=False):
         """
         Send a message in a separate thread. If reply_to_message_id is provided, send as a thread (reply).
         """
@@ -44,6 +44,10 @@ class TelegramBot:
                         reply_to_message_id=reply_to_message_id
                     )
                     log(res)
+                    if pin_msg:
+                        try:
+                            self.bot.pin_chat_message(chat_id=_chat_id, message_id=res.message_id)
+                        except: pass
                 return
             res = self.bot.send_message(
                 chat_id=chat_id,
@@ -53,6 +57,10 @@ class TelegramBot:
                 reply_to_message_id=reply_to_message_id
             )
             log(res)
+            if pin_msg:
+                try:
+                    self.bot.pin_chat_message(chat_id=_chat_id, message_id=res.message_id)
+                except: pass
         threading.Thread(target=_send, daemon=True).start()
             
     def send_photo(self, image_uri, msg, chat_id=None, symbol=None):

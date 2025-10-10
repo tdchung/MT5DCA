@@ -134,6 +134,8 @@ def main():
         current_price = (bid + ask) / 2
         logger.info(f"Current Price: {current_price:.2f}")
 
+        return
+
         order_results = []
 
         # Step 2
