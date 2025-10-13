@@ -39,8 +39,8 @@ TRADE_SYMBOL = "XAUUSDc"
 # TRADE_SYMBOL = "XAUUSD"
 DELTA_ENTER_PRICE = 0.4
 TARGET_PROFIT = 2.5
-TRADE_AMOUNT = 0.03
-TP_EXPECTED    = 30
+TRADE_AMOUNT = 0.02
+TP_EXPECTED    = 20
 MAX_REDUCE_BALANCE = 540  # Max balance reduction before stopping the script
 
 MIN_FREE_MARGIN = 400  # Minimum free margin to continue trading
@@ -229,21 +229,27 @@ def run_at_index(mt5_api, symbol, amount, index, price=0, logger=None):
         if logger:
             logger.info(f"run_at_index: Current price for {symbol}: {price:.2f}")
 
+        percent0 = abs(index) / 100      * 10
+        percent1 = abs(index + 1) / 100 * 10
+        percent2 = abs(index + 2) / 100 * 10
+        percent_1 = abs(index - 1) / 100 * 10
+        percent_2 = abs(index - 2) / 100 * 10
+
         # Calculate buy stop entries and TP
-        buy_entry_1 = price + DELTA_ENTER_PRICE
-        buy_tp_1 = buy_entry_1 + TARGET_PROFIT
-        buy_entry_2 = price + TARGET_PROFIT + DELTA_ENTER_PRICE
-        buy_tp_2 = buy_entry_2 + TARGET_PROFIT
-        buy_entry_3 = price + 2 * TARGET_PROFIT + DELTA_ENTER_PRICE
-        buy_tp_3 = buy_entry_3 + TARGET_PROFIT
+        buy_entry_1 = price + DELTA_ENTER_PRICE * (1 + percent0)
+        buy_tp_1 = buy_entry_1 + TARGET_PROFIT * (1 + percent0)
+        buy_entry_2 = price + TARGET_PROFIT * (1 + percent0) + DELTA_ENTER_PRICE * (1 + percent1)
+        buy_tp_2 = buy_entry_2 + TARGET_PROFIT * (1 + percent1)
+        buy_entry_3 = price  + TARGET_PROFIT * (1 + percent0) + TARGET_PROFIT * (1 + percent1) + DELTA_ENTER_PRICE * (1 + percent2)
+        buy_tp_3 = buy_entry_3 + TARGET_PROFIT * (1 + percent2)
 
         # Calculate sell stop entries and TP
-        sell_entry_1 = price - DELTA_ENTER_PRICE
-        sell_tp_1 = sell_entry_1 - TARGET_PROFIT
-        sell_entry_2 = price - TARGET_PROFIT - DELTA_ENTER_PRICE
-        sell_tp_2 = sell_entry_2 - TARGET_PROFIT
-        sell_entry_3 = price - 2 * TARGET_PROFIT - DELTA_ENTER_PRICE
-        sell_tp_3 = sell_entry_3 - TARGET_PROFIT
+        sell_entry_1 = price - DELTA_ENTER_PRICE * (1 + percent0)
+        sell_tp_1 = sell_entry_1 - TARGET_PROFIT * (1 + percent0)
+        sell_entry_2 = price - TARGET_PROFIT * (1 + percent0) - DELTA_ENTER_PRICE * (1 + percent_1)
+        sell_tp_2 = sell_entry_2 - TARGET_PROFIT * (1 + percent_1)
+        sell_entry_3 = price - TARGET_PROFIT * (1 + percent0) - TARGET_PROFIT * (1 + percent_1) - DELTA_ENTER_PRICE * (1 + percent_2)
+        sell_tp_3 = sell_entry_3 - TARGET_PROFIT * (1 + percent_2)
 
         # Use trade amount scaled by FIBONACCI_LEVELS
         fibb_amount_1 = amount * FIBONACCI_LEVELS[abs(index)]
@@ -304,21 +310,22 @@ def run_at_index(mt5_api, symbol, amount, index, price=0, logger=None):
             filled = False
             order_id = None
             price = None
+            order_status = ''
             if order_obj:
                 order_id = getattr(order_obj, 'order', None)
                 price = getattr(order_obj.request, 'price', None)
+                order_status = getattr(order_obj, 'status', '')
                 price = round(price, 3) if price is not None else None
-            # Check if filled (notified_filled is global in main, but here we only know 'placed')
-            if status == 'placed':
+            if status == 'placed' and order_status != 'filled':
                 status_str = '✔️'
-            elif status == 'filled':
+            elif status == 'placed' and order_status == 'filled':
                 status_str = '✅'
             else:
                 status_str = '❔'
             side, idx = key.split('_')
             side_str = 'Buy' if side == 'buy' else 'Sell'
             idx_str = idx
-            return f"{{status: {status_str}}} {side_str} {idx_str}: {price if price is not None else '-'} {order_id if order_id is not None else '-'}"
+            return f"status: {status_str} {side_str} {idx_str}: {price if price is not None else '-'} {order_id if order_id is not None else '-'}"
 
 
         # Show all keys in gDetailOrders
