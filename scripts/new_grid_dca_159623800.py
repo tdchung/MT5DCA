@@ -31,7 +31,7 @@ telegramBot = TelegramBot(TELEGRAM_API_TOKEN, TELEGRAM_BOT_NAME)
 
 ################################################################################################
 # FIBONACCI_LEVELS = [1, 1, 2, 3, 5, 8, 13, 21, 34]
-FIBONACCI_LEVELS = [1, 1, 2, 2, 3, 5, 8, 13, 21]
+FIBONACCI_LEVELS = [1, 1, 2, 2, 3, 5, 8, 13, 13, 13, 13, 13]
 
 CONFIG_FILE = f"config/mt5_config_159623800.json"
 
@@ -41,9 +41,11 @@ DELTA_ENTER_PRICE = 0.4
 TARGET_PROFIT = 2.5
 TRADE_AMOUNT = 0.02
 TP_EXPECTED    = 20
-MAX_REDUCE_BALANCE = 540  # Max balance reduction before stopping the script
+INCREASE_FACTOR = 10  # Increase factor for grid spacing
 
-MIN_FREE_MARGIN = 400  # Minimum free margin to continue trading
+MAX_REDUCE_BALANCE = 100  # Max balance reduction before stopping the script
+
+MIN_FREE_MARGIN = 100  # Minimum free margin to continue trading
 
 gDetailOrders = {
     'buy_9': {'status': None},
@@ -87,6 +89,8 @@ gDetailOrders = {
 }
 gCurrentIdx = 0
 gStartBalance = 0
+
+notified_filled = set()
 
 ################################################################################################
 def check_pending_order_filled(history, order_id, logger=None):
@@ -199,6 +203,7 @@ def place_pending_order(mt5_api, symbol, order_type, price, tp_price, volume=0.0
 def run_at_index(mt5_api, symbol, amount, index, price=0, logger=None):
     global gDetailOrders
     global gStartBalance
+    global notified_filled
 
     try:
         current_balance = get_current_balance(mt5_api, logger=logger)
@@ -229,11 +234,11 @@ def run_at_index(mt5_api, symbol, amount, index, price=0, logger=None):
         if logger:
             logger.info(f"run_at_index: Current price for {symbol}: {price:.2f}")
 
-        percent0 = abs(index) / 100      * 10
-        percent1 = abs(index + 1) / 100 * 10
-        percent2 = abs(index + 2) / 100 * 10
-        percent_1 = abs(index - 1) / 100 * 10
-        percent_2 = abs(index - 2) / 100 * 10
+        percent0 = abs(index) / 100      * INCREASE_FACTOR
+        percent1 = abs(index + 1) / 100 * INCREASE_FACTOR
+        percent2 = abs(index + 2) / 100 * INCREASE_FACTOR
+        percent_1 = abs(index - 1) / 100 * INCREASE_FACTOR
+        percent_2 = abs(index - 2) / 100 * INCREASE_FACTOR
 
         # Calculate buy stop entries and TP
         buy_entry_1 = price + DELTA_ENTER_PRICE * (1 + percent0)
@@ -307,7 +312,6 @@ def run_at_index(mt5_api, symbol, amount, index, price=0, logger=None):
         def get_order_status_str(key, val):
             order_obj = val.get('order')
             status = val.get('status')
-            filled = False
             order_id = None
             price = None
             order_status = ''
@@ -316,7 +320,10 @@ def run_at_index(mt5_api, symbol, amount, index, price=0, logger=None):
                 price = getattr(order_obj.request, 'price', None)
                 order_status = getattr(order_obj, 'status', '')
                 price = round(price, 3) if price is not None else None
-            if status == 'placed' and order_status != 'filled':
+            # Check notified_filled for this order_id
+            if order_id is not None and order_id in notified_filled:
+                status_str = '✅'
+            elif status == 'placed' and order_status != 'filled':
                 status_str = '✔️'
             elif status == 'placed' and order_status == 'filled':
                 status_str = '✅'
@@ -483,6 +490,7 @@ def cancel_all_pending_orders(mt5_api, symbol, logger=None):
 def main():
     global gDetailOrders, gCurrentIdx
     global gStartBalance
+    global notified_filled
     
     logging.basicConfig(
         level=logging.INFO,
@@ -651,7 +659,7 @@ def main():
                     )
 
                     logger.info(msg)
-                    telegramBot.send_message(msg, chat_id=TELEGRAM_CHAT_ID)
+                    telegramBot.send_message(msg, chat_id=TELEGRAM_CHAT_ID, pin_msg=True)
 
                     # Check if any open positions or open orders remain
                     positions_left = mt5.get_positions()

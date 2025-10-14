@@ -46,7 +46,7 @@ class TelegramBot:
                     log(res)
                     if pin_msg:
                         try:
-                            self.bot.pin_chat_message(chat_id=_chat_id, message_id=res.message_id)
+                            self.bot.pin_chat_message(chat_id=_chat_id, message_id=res['message_id'])
                         except: pass
                 return
             res = self.bot.send_message(
@@ -59,7 +59,7 @@ class TelegramBot:
             log(res)
             if pin_msg:
                 try:
-                    self.bot.pin_chat_message(chat_id=_chat_id, message_id=res.message_id)
+                    self.bot.pin_chat_message(chat_id=_chat_id, message_id=res['message_id'])
                 except: pass
         threading.Thread(target=_send, daemon=True).start()
             

@@ -30,7 +30,7 @@ TELEGRAM_CHAT_ID = "1661018465"
 telegramBot = TelegramBot(TELEGRAM_API_TOKEN, TELEGRAM_BOT_NAME)
 
 ################################################################################################
-FIBONACCI_LEVELS = [1, 1, 2, 2, 3, 3, 5, 8, 13, 21]
+FIBONACCI_LEVELS = [1, 1, 2, 2, 3, 3, 5, 8, 13, 13, 13, 13]
 
 CONFIG_FILE = f"config/mt5_config_183585926.json"
 
@@ -40,8 +40,9 @@ DELTA_ENTER_PRICE = 0.8
 TARGET_PROFIT = 2.0
 TRADE_AMOUNT = 0.03
 TP_EXPECTED    = 80
-MAX_REDUCE_BALANCE = 2000  # Max balance reduction before stopping the script
-MIN_FREE_MARGIN = 1000  # Minimum free margin to continue trading
+INCREASE_FACTOR = 12
+MAX_REDUCE_BALANCE = 100  # Max balance reduction before stopping the script
+MIN_FREE_MARGIN = 100  # Minimum free margin to continue trading
 
 gDetailOrders = {
     'buy_9': {'status': None},
@@ -85,6 +86,8 @@ gDetailOrders = {
 }
 gCurrentIdx = 0
 gStartBalance = 0
+
+notified_filled = set()
 
 ################################################################################################
 def check_pending_order_filled(history, order_id, logger=None):
@@ -198,6 +201,9 @@ def run_at_index(mt5_api, symbol, amount, index, price=0, logger=None):
     global gDetailOrders
     global gStartBalance
 
+
+    # Use notified_filled as in latest version
+    global notified_filled
     try:
         current_balance = get_current_balance(mt5_api, logger=logger)
         current_equity = get_current_equity(mt5_api, logger=logger)
@@ -207,13 +213,13 @@ def run_at_index(mt5_api, symbol, amount, index, price=0, logger=None):
                 logger.error(f"⛔️ Current equity {current_equity} has reduced more than {MAX_REDUCE_BALANCE} from start balance {gStartBalance}. Stopping further trades.")
             telegramBot.send_message(f"⛔️ Current equity {current_equity} has reduced more than {MAX_REDUCE_BALANCE} from start balance {gStartBalance}. Stopping further trades.", chat_id=TELEGRAM_CHAT_ID)
             return
-        
+
         if current_fee_margin < MIN_FREE_MARGIN:
             if logger:
                 logger.error(f"⛔️ Current free margin {current_fee_margin} is below minimum required {MIN_FREE_MARGIN}. Stopping further trades.")
             telegramBot.send_message(f"⛔️ Current free margin {current_fee_margin} is below minimum required {MIN_FREE_MARGIN}. Stopping further trades.", chat_id=TELEGRAM_CHAT_ID)
             return
-        
+
         # Get current price from MT5
         tick = mt5_api.symbol_info_tick(symbol)
         if not tick:
@@ -221,27 +227,32 @@ def run_at_index(mt5_api, symbol, amount, index, price=0, logger=None):
                 logger.error(f"Could not get tick for {symbol}")
             return
 
-        # price = tick.ask if tick.ask else tick.last
         if not price:
             price = (tick.bid + tick.ask) / 2
         if logger:
             logger.info(f"run_at_index: Current price for {symbol}: {price:.2f}")
 
+        percent0 = abs(index) / 100 * INCREASE_FACTOR
+        percent1 = abs(index + 1) / 100 * INCREASE_FACTOR
+        percent2 = abs(index + 2) / 100 * INCREASE_FACTOR
+        percent_1 = abs(index - 1) / 100 * INCREASE_FACTOR
+        percent_2 = abs(index - 2) / 100 * INCREASE_FACTOR
+
         # Calculate buy stop entries and TP
-        buy_entry_1 = price + DELTA_ENTER_PRICE
-        buy_tp_1 = buy_entry_1 + TARGET_PROFIT
-        buy_entry_2 = price + TARGET_PROFIT + DELTA_ENTER_PRICE
-        buy_tp_2 = buy_entry_2 + TARGET_PROFIT
-        buy_entry_3 = price + 2 * TARGET_PROFIT + DELTA_ENTER_PRICE
-        buy_tp_3 = buy_entry_3 + TARGET_PROFIT
+        buy_entry_1 = price + DELTA_ENTER_PRICE * (1 + percent0)
+        buy_tp_1 = buy_entry_1 + TARGET_PROFIT * (1 + percent0)
+        buy_entry_2 = price + TARGET_PROFIT * (1 + percent0) + DELTA_ENTER_PRICE * (1 + percent1)
+        buy_tp_2 = buy_entry_2 + TARGET_PROFIT * (1 + percent1)
+        buy_entry_3 = price + TARGET_PROFIT * (1 + percent0) + TARGET_PROFIT * (1 + percent1) + DELTA_ENTER_PRICE * (1 + percent2)
+        buy_tp_3 = buy_entry_3 + TARGET_PROFIT * (1 + percent2)
 
         # Calculate sell stop entries and TP
-        sell_entry_1 = price - DELTA_ENTER_PRICE
-        sell_tp_1 = sell_entry_1 - TARGET_PROFIT
-        sell_entry_2 = price - TARGET_PROFIT - DELTA_ENTER_PRICE
-        sell_tp_2 = sell_entry_2 - TARGET_PROFIT
-        sell_entry_3 = price - 2 * TARGET_PROFIT - DELTA_ENTER_PRICE
-        sell_tp_3 = sell_entry_3 - TARGET_PROFIT
+        sell_entry_1 = price - DELTA_ENTER_PRICE * (1 + percent0)
+        sell_tp_1 = sell_entry_1 - TARGET_PROFIT * (1 + percent0)
+        sell_entry_2 = price - TARGET_PROFIT * (1 + percent0) - DELTA_ENTER_PRICE * (1 + percent_1)
+        sell_tp_2 = sell_entry_2 - TARGET_PROFIT * (1 + percent_1)
+        sell_entry_3 = price - TARGET_PROFIT * (1 + percent0) - TARGET_PROFIT * (1 + percent_1) - DELTA_ENTER_PRICE * (1 + percent_2)
+        sell_tp_3 = sell_entry_3 - TARGET_PROFIT * (1 + percent_2)
 
         # Use trade amount scaled by FIBONACCI_LEVELS
         fibb_amount_1 = amount * FIBONACCI_LEVELS[abs(index)]
@@ -299,17 +310,20 @@ def run_at_index(mt5_api, symbol, amount, index, price=0, logger=None):
         def get_order_status_str(key, val):
             order_obj = val.get('order')
             status = val.get('status')
-            filled = False
             order_id = None
             price = None
+            order_status = ''
             if order_obj:
                 order_id = getattr(order_obj, 'order', None)
                 price = getattr(order_obj.request, 'price', None)
+                order_status = getattr(order_obj, 'status', '')
                 price = round(price, 3) if price is not None else None
-            # Check if filled (notified_filled is global in main, but here we only know 'placed')
-            if status == 'placed':
+            # Check notified_filled for this order_id
+            if order_id is not None and order_id in notified_filled:
+                status_str = '✅'
+            elif status == 'placed' and order_status != 'filled':
                 status_str = '✔️'
-            elif status == 'filled':
+            elif status == 'placed' and order_status == 'filled':
                 status_str = '✅'
             else:
                 status_str = '❔'
@@ -474,6 +488,7 @@ def cancel_all_pending_orders(mt5_api, symbol, logger=None):
 def main():
     global gDetailOrders, gCurrentIdx
     global gStartBalance
+    global notified_filled
     
     logging.basicConfig(
         level=logging.INFO,
@@ -640,7 +655,7 @@ def main():
                     )
 
                     logger.info(msg)
-                    telegramBot.send_message(msg, chat_id=TELEGRAM_CHAT_ID)
+                    telegramBot.send_message(msg, chat_id=TELEGRAM_CHAT_ID, pin_msg=True)
 
                     # Check if any open positions or open orders remain
                     positions_left = mt5.get_positions()
