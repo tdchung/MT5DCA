@@ -39,12 +39,12 @@ TRADE_SYMBOL = "XAUUSDc"
 # TRADE_SYMBOL = "XAUUSD"
 DELTA_ENTER_PRICE = 0.4
 TARGET_PROFIT = 2.5
-TRADE_AMOUNT = 0.02
-TP_EXPECTED    = 20
+
+TRADE_AMOUNT = 0.07
+TP_EXPECTED    = 70
+
 INCREASE_FACTOR = 10  # Increase factor for grid spacing
-
-MAX_REDUCE_BALANCE = 100  # Max balance reduction before stopping the script
-
+MAX_REDUCE_BALANCE = 5000  # Max balance reduction before stopping the script
 MIN_FREE_MARGIN = 100  # Minimum free margin to continue trading
 
 gDetailOrders = {

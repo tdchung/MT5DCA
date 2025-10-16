@@ -23,8 +23,8 @@ if src_path not in sys.path:
 
 
 ################################################################################################
-TELEGRAM_API_TOKEN = f"5726946410:AAHA7N2q8bQYCUcYMeEtQd1w74a77IdOnC0"
-TELEGRAM_BOT_NAME = "@tdc_main_gold_bot"
+TELEGRAM_API_TOKEN = f"7461366301:AAH1RPzgKt1ClP-HAhNzpnV0twQn8UbZveU"
+TELEGRAM_BOT_NAME = "@NewPairDexscreenerbot"
 TELEGRAM_CHAT_ID = "1661018465"
 
 telegramBot = TelegramBot(TELEGRAM_API_TOKEN, TELEGRAM_BOT_NAME)
@@ -33,17 +33,17 @@ telegramBot = TelegramBot(TELEGRAM_API_TOKEN, TELEGRAM_BOT_NAME)
 # FIBONACCI_LEVELS = [1, 1, 2, 3, 5, 8, 13, 21, 34]
 FIBONACCI_LEVELS = [1, 1, 2, 2, 3, 5, 8, 13, 13, 13, 13, 13]
 
-CONFIG_FILE = f"config/mt5_config_263120967.json"
+CONFIG_FILE = f"config/mt5_config_183628411.json"
 
 TRADE_SYMBOL = "XAUUSDc"
 # TRADE_SYMBOL = "XAUUSD"
-DELTA_ENTER_PRICE = 0.4
+DELTA_ENTER_PRICE = 0.35
 TARGET_PROFIT = 2.5
 
-TRADE_AMOUNT = 0.08
-TP_EXPECTED    = 80
+TRADE_AMOUNT = 0.04
+TP_EXPECTED    = 40
 
-INCREASE_FACTOR = 13
+INCREASE_FACTOR = 8  # Increase factor for grid spacing
 MAX_REDUCE_BALANCE = 5000  # Max balance reduction before stopping the script
 MIN_FREE_MARGIN = 100  # Minimum free margin to continue trading
 
@@ -89,6 +89,7 @@ gDetailOrders = {
 }
 gCurrentIdx = 0
 gStartBalance = 0
+
 notified_filled = set()
 
 ################################################################################################
@@ -202,10 +203,8 @@ def place_pending_order(mt5_api, symbol, order_type, price, tp_price, volume=0.0
 def run_at_index(mt5_api, symbol, amount, index, price=0, logger=None):
     global gDetailOrders
     global gStartBalance
-
-
-    # Use notified_filled as in latest version
     global notified_filled
+
     try:
         current_balance = get_current_balance(mt5_api, logger=logger)
         current_equity = get_current_equity(mt5_api, logger=logger)
@@ -215,13 +214,13 @@ def run_at_index(mt5_api, symbol, amount, index, price=0, logger=None):
                 logger.error(f"⛔️ Current equity {current_equity} has reduced more than {MAX_REDUCE_BALANCE} from start balance {gStartBalance}. Stopping further trades.")
             telegramBot.send_message(f"⛔️ Current equity {current_equity} has reduced more than {MAX_REDUCE_BALANCE} from start balance {gStartBalance}. Stopping further trades.", chat_id=TELEGRAM_CHAT_ID)
             return
-
+        
         if current_fee_margin < MIN_FREE_MARGIN:
             if logger:
                 logger.error(f"⛔️ Current free margin {current_fee_margin} is below minimum required {MIN_FREE_MARGIN}. Stopping further trades.")
             telegramBot.send_message(f"⛔️ Current free margin {current_fee_margin} is below minimum required {MIN_FREE_MARGIN}. Stopping further trades.", chat_id=TELEGRAM_CHAT_ID)
             return
-
+        
         # Get current price from MT5
         tick = mt5_api.symbol_info_tick(symbol)
         if not tick:
@@ -229,12 +228,13 @@ def run_at_index(mt5_api, symbol, amount, index, price=0, logger=None):
                 logger.error(f"Could not get tick for {symbol}")
             return
 
+        # price = tick.ask if tick.ask else tick.last
         if not price:
             price = (tick.bid + tick.ask) / 2
         if logger:
             logger.info(f"run_at_index: Current price for {symbol}: {price:.2f}")
 
-        percent0 = abs(index) / 100 * INCREASE_FACTOR
+        percent0 = abs(index) / 100      * INCREASE_FACTOR
         percent1 = abs(index + 1) / 100 * INCREASE_FACTOR
         percent2 = abs(index + 2) / 100 * INCREASE_FACTOR
         percent_1 = abs(index - 1) / 100 * INCREASE_FACTOR
@@ -245,7 +245,7 @@ def run_at_index(mt5_api, symbol, amount, index, price=0, logger=None):
         buy_tp_1 = buy_entry_1 + TARGET_PROFIT * (1 + percent0)
         buy_entry_2 = price + TARGET_PROFIT * (1 + percent0) + DELTA_ENTER_PRICE * (1 + percent1)
         buy_tp_2 = buy_entry_2 + TARGET_PROFIT * (1 + percent1)
-        buy_entry_3 = price + TARGET_PROFIT * (1 + percent0) + TARGET_PROFIT * (1 + percent1) + DELTA_ENTER_PRICE * (1 + percent2)
+        buy_entry_3 = price  + TARGET_PROFIT * (1 + percent0) + TARGET_PROFIT * (1 + percent1) + DELTA_ENTER_PRICE * (1 + percent2)
         buy_tp_3 = buy_entry_3 + TARGET_PROFIT * (1 + percent2)
 
         # Calculate sell stop entries and TP
@@ -332,7 +332,7 @@ def run_at_index(mt5_api, symbol, amount, index, price=0, logger=None):
             side, idx = key.split('_')
             side_str = 'Buy' if side == 'buy' else 'Sell'
             idx_str = idx
-            return f"{{status: {status_str}}} {side_str} {idx_str}: {price if price is not None else '-'} {order_id if order_id is not None else '-'}"
+            return f"status: {status_str} {side_str} {idx_str}: {price if price is not None else '-'} {order_id if order_id is not None else '-'}"
 
 
         # Show all keys in gDetailOrders

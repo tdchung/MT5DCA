@@ -38,10 +38,12 @@ TRADE_SYMBOL = "XAUUSDc"
 # TRADE_SYMBOL = "XAUUSD"
 DELTA_ENTER_PRICE = 0.8
 TARGET_PROFIT = 2.0
-TRADE_AMOUNT = 0.03
+
+TRADE_AMOUNT = 0.08
 TP_EXPECTED    = 80
+
 INCREASE_FACTOR = 12
-MAX_REDUCE_BALANCE = 100  # Max balance reduction before stopping the script
+MAX_REDUCE_BALANCE = 5000  # Max balance reduction before stopping the script
 MIN_FREE_MARGIN = 100  # Minimum free margin to continue trading
 
 gDetailOrders = {
@@ -312,10 +314,12 @@ def run_at_index(mt5_api, symbol, amount, index, price=0, logger=None):
             status = val.get('status')
             order_id = None
             price = None
+            volume = None
             order_status = ''
             if order_obj:
                 order_id = getattr(order_obj, 'order', None)
                 price = getattr(order_obj.request, 'price', None)
+                volume = getattr(order_obj.request, 'volume', None)
                 order_status = getattr(order_obj, 'status', '')
                 price = round(price, 3) if price is not None else None
             # Check notified_filled for this order_id
@@ -330,12 +334,12 @@ def run_at_index(mt5_api, symbol, amount, index, price=0, logger=None):
             side, idx = key.split('_')
             side_str = 'Buy' if side == 'buy' else 'Sell'
             idx_str = idx
-            return f"{{status: {status_str}}} {side_str} {idx_str}: {price if price is not None else '-'} {order_id if order_id is not None else '-'}"
+            return f"Status: {status_str} {side_str} <b>{idx_str}</b>: <code>{price if price is not None else '-'}</code> {volume if volume is not None else '-'}"
 
 
         # Show all keys in gDetailOrders
         if len(new_orders) > 0:
-            telegramBot.send_message(f"New Orders Placed:\n" + '\n'.join([get_order_status_str(k, gDetailOrders[k]) for k in sorted(gDetailOrders.keys()) if gDetailOrders[k].get('order') in new_orders]), chat_id=TELEGRAM_CHAT_ID)
+            telegramBot.send_message(f"<b>New Orders Placed:</b>\n\n" + '\n'.join([get_order_status_str(k, gDetailOrders[k]) for k in sorted(gDetailOrders.keys()) if gDetailOrders[k].get('order') in new_orders]), chat_id=TELEGRAM_CHAT_ID)
 
             # Sort keys: buys descending, sells ascending
             def order_sort_key(x):
@@ -357,7 +361,7 @@ def run_at_index(mt5_api, symbol, amount, index, price=0, logger=None):
             if logger:
                 logger.info(f"All Order Status List:\n{all_status_report}")
             # Send to Telegram
-            telegramBot.send_message(f"All Order Status List:\n{all_status_report}", chat_id=TELEGRAM_CHAT_ID)
+            telegramBot.send_message(f"<b>All Order Status List:</b>\n\n{all_status_report}", chat_id=TELEGRAM_CHAT_ID)
 
             if logger:
                 logger.info(f"Grid orders placed for index {index}: buy/sell stops at {buy_entry_1:.2f}, {buy_entry_2:.2f}, {buy_entry_3:.2f}, {sell_entry_1:.2f}, {sell_entry_2:.2f}, {sell_entry_3:.2f}")
