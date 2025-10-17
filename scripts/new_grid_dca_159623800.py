@@ -40,11 +40,11 @@ TRADE_SYMBOL = "XAUUSDc"
 DELTA_ENTER_PRICE = 0.4
 TARGET_PROFIT = 2.5
 
-TRADE_AMOUNT = 0.07
-TP_EXPECTED    = 70
+TRADE_AMOUNT = 0.15
+TP_EXPECTED    = 150
 
-INCREASE_FACTOR = 10  # Increase factor for grid spacing
-MAX_REDUCE_BALANCE = 5000  # Max balance reduction before stopping the script
+PERCENT_SCALE = 10  # Percent scale factor for grid spacing (used as: percent = abs(index)/100 * PERCENT_SCALE)
+MAX_REDUCE_BALANCE = 15000  # Max balance reduction before stopping the script
 MIN_FREE_MARGIN = 100  # Minimum free margin to continue trading
 
 gDetailOrders = {
@@ -90,7 +90,7 @@ gDetailOrders = {
 gCurrentIdx = 0
 gStartBalance = 0
 
-notified_filled = set()
+gNotifiedFilled = set()
 
 ################################################################################################
 def check_pending_order_filled(history, order_id, logger=None):
@@ -162,6 +162,7 @@ def get_current_free_margin(mt5_api, logger=None):
         logger.error(f"Error getting current free margin: {e}")
     return current_free_margin
 
+
 ###############################################################################################################
 def place_pending_order(mt5_api, symbol, order_type, price, tp_price, volume=0.01, comment="", logger=None):
     existing_orders = mt5_api.orders_get(symbol=symbol)
@@ -190,8 +191,11 @@ def place_pending_order(mt5_api, symbol, order_type, price, tp_price, volume=0.0
         return None
     if result.retcode != mt5_api.TRADE_RETCODE_DONE:
         if logger:
-            logger.error(f"⭕️ :: {comment} :: Order failed, retcode: {result.retcode}, comment: {result.comment}")
-            # telegramBot.send_message(f"⭕️ :: {comment} :: Order failed, retcode: {result.retcode}, comment: {result.comment}", chat_id=TELEGRAM_CHAT_ID)
+            # logger.error(f"⭕️ :: {comment} :: Order failed, retcode: {result.retcode}, comment: {result.comment}")
+            telegramBot.send_message(
+                f"⭕️ :: {comment} :: Order failed, retcode: {result.retcode}, comment: {result.comment}",
+                chat_id=TELEGRAM_CHAT_ID,
+            )
         return None
     order_type_str = "BUY STOP" if order_type == mt5_api.ORDER_TYPE_BUY_STOP else "SELL STOP"
     if logger:
@@ -200,10 +204,70 @@ def place_pending_order(mt5_api, symbol, order_type, price, tp_price, volume=0.0
     return result
 
 
+###############################################################################################################
+# Show order status list
+def get_order_status_str(key, val):
+    global gNotifiedFilled
+    msg = ''
+    try:
+        order_obj = val.get('order')
+        status = val.get('status')
+        order_id = None
+        price = None
+        volume = None
+        order_status = ''
+        if order_obj:
+            order_id = getattr(order_obj, 'order', None)
+            price = getattr(order_obj.request, 'price', None)
+            volume = getattr(order_obj.request, 'volume', None)
+            order_status = getattr(order_obj, 'status', '')
+            price = round(price, 3) if price is not None else None
+            volume = round(volume, 2) if volume is not None else None
+        # Check gNotifiedFilled for this order_id
+        if order_id is not None and order_id in gNotifiedFilled:
+            status_str = '✅'
+        elif status == 'placed' and order_status != 'filled':
+            status_str = '✔️'
+        elif status == 'placed' and order_status == 'filled':
+            status_str = '✅'
+        else:
+            status_str = '❔'
+        side, idx = key.split('_')
+        side_str = 'Buy' if side == 'buy' else 'Sell'
+        idx_str = idx
+        return f"Status: {status_str} {side_str} <b>{idx_str}</b>: <code>{price if price is not None else '-'}</code> {volume if volume is not None else '-'}"
+    except Exception as e:
+        print(f"ERROR in get_order_status_str: {e}")
+    return msg
+
+###################################################################################
+def get_all_order_status_str(logger=None):
+    global gDetailOrders
+    all_status_report = ''
+    try:
+        # Sort keys: buys descending, sells ascending
+        def order_sort_key(x):
+            side, idx = x.split('_')
+            idx = int(idx)
+            return (0, idx)
+        
+        sorted_keys = sorted(gDetailOrders.keys(), key=order_sort_key)
+        all_order_status_lines = []
+        for key in sorted_keys:
+            val = gDetailOrders.get(key, {})
+            if val and val.get('order') is not None:
+                all_order_status_lines.append(get_order_status_str(key, val))
+        all_status_report = '\n'.join(all_order_status_lines)
+    except Exception as e:
+        if logger:
+            logger.error(f"Error in get_all_order_status_str: {e}")
+    return all_status_report
+
+###############################################################################################################
 def run_at_index(mt5_api, symbol, amount, index, price=0, logger=None):
     global gDetailOrders
     global gStartBalance
-    global notified_filled
+    global gNotifiedFilled
 
     try:
         current_balance = get_current_balance(mt5_api, logger=logger)
@@ -234,18 +298,18 @@ def run_at_index(mt5_api, symbol, amount, index, price=0, logger=None):
         if logger:
             logger.info(f"run_at_index: Current price for {symbol}: {price:.2f}")
 
-        percent0 = abs(index) / 100      * INCREASE_FACTOR
-        percent1 = abs(index + 1) / 100 * INCREASE_FACTOR
-        percent2 = abs(index + 2) / 100 * INCREASE_FACTOR
-        percent_1 = abs(index - 1) / 100 * INCREASE_FACTOR
-        percent_2 = abs(index - 2) / 100 * INCREASE_FACTOR
+        percent0 = abs(index) / 100      * PERCENT_SCALE
+        percent1 = abs(index + 1) / 100 * PERCENT_SCALE
+        percent2 = abs(index + 2) / 100 * PERCENT_SCALE
+        percent_1 = abs(index - 1) / 100 * PERCENT_SCALE
+        percent_2 = abs(index - 2) / 100 * PERCENT_SCALE
 
         # Calculate buy stop entries and TP
         buy_entry_1 = price + DELTA_ENTER_PRICE * (1 + percent0)
         buy_tp_1 = buy_entry_1 + TARGET_PROFIT * (1 + percent0)
         buy_entry_2 = price + TARGET_PROFIT * (1 + percent0) + DELTA_ENTER_PRICE * (1 + percent1)
         buy_tp_2 = buy_entry_2 + TARGET_PROFIT * (1 + percent1)
-        buy_entry_3 = price  + TARGET_PROFIT * (1 + percent0) + TARGET_PROFIT * (1 + percent1) + DELTA_ENTER_PRICE * (1 + percent2)
+        buy_entry_3 = price + TARGET_PROFIT * (1 + percent0) + TARGET_PROFIT * (1 + percent1) + DELTA_ENTER_PRICE * (1 + percent2)
         buy_tp_3 = buy_entry_3 + TARGET_PROFIT * (1 + percent2)
 
         # Calculate sell stop entries and TP
@@ -308,58 +372,14 @@ def run_at_index(mt5_api, symbol, amount, index, price=0, logger=None):
                 gDetailOrders[sell_comment_3] = {'status': 'placed', 'order': res_sell_3}
                 new_orders.append(res_sell_3)
 
-        # Show order status list
-        def get_order_status_str(key, val):
-            order_obj = val.get('order')
-            status = val.get('status')
-            order_id = None
-            price = None
-            order_status = ''
-            if order_obj:
-                order_id = getattr(order_obj, 'order', None)
-                price = getattr(order_obj.request, 'price', None)
-                order_status = getattr(order_obj, 'status', '')
-                price = round(price, 3) if price is not None else None
-            # Check notified_filled for this order_id
-            if order_id is not None and order_id in notified_filled:
-                status_str = '✅'
-            elif status == 'placed' and order_status != 'filled':
-                status_str = '✔️'
-            elif status == 'placed' and order_status == 'filled':
-                status_str = '✅'
-            else:
-                status_str = '❔'
-            side, idx = key.split('_')
-            side_str = 'Buy' if side == 'buy' else 'Sell'
-            idx_str = idx
-            return f"status: {status_str} {side_str} {idx_str}: {price if price is not None else '-'} {order_id if order_id is not None else '-'}"
-
-
         # Show all keys in gDetailOrders
         if len(new_orders) > 0:
-            telegramBot.send_message(f"New Orders Placed:\n" + '\n'.join([get_order_status_str(k, gDetailOrders[k]) for k in sorted(gDetailOrders.keys()) if gDetailOrders[k].get('order') in new_orders]), chat_id=TELEGRAM_CHAT_ID)
-
-            # Sort keys: buys descending, sells ascending
-            def order_sort_key(x):
-                side, idx = x.split('_')
-                idx = int(idx)
-                # if side == 'buy':
-                #     return (0, -idx)
-                # else:
-                # return (1, idx)
-                return (0, idx)
-
-            sorted_keys = sorted(gDetailOrders.keys(), key=order_sort_key)
-            all_order_status_lines = []
-            for key in sorted_keys:
-                val = gDetailOrders.get(key, {})
-                if val and val.get('order') is not None:
-                    all_order_status_lines.append(get_order_status_str(key, val))
-            all_status_report = '\n'.join(all_order_status_lines)
-            if logger:
-                logger.info(f"All Order Status List:\n{all_status_report}")
-            # Send to Telegram
-            telegramBot.send_message(f"All Order Status List:\n{all_status_report}", chat_id=TELEGRAM_CHAT_ID)
+            telegramBot.send_message(f"<b>New Orders Placed:</b>\n\n" + '\n'.join([get_order_status_str(k, gDetailOrders[k]) for k in sorted(gDetailOrders.keys()) if gDetailOrders[k].get('order') in new_orders]), chat_id=TELEGRAM_CHAT_ID)
+            # Show all order status
+            all_status_report = get_all_order_status_str(logger=logger)
+            # if logger: logger.info(f"All Order Status List:\n{all_status_report}")
+            # # Send to Telegram
+            # telegramBot.send_message(f"<b>All Order Status List:</b>\n\n{all_status_report}", chat_id=TELEGRAM_CHAT_ID)
 
             if logger:
                 logger.info(f"Grid orders placed for index {index}: buy/sell stops at {buy_entry_1:.2f}, {buy_entry_2:.2f}, {buy_entry_3:.2f}, {sell_entry_1:.2f}, {sell_entry_2:.2f}, {sell_entry_3:.2f}")
@@ -479,7 +499,7 @@ def cancel_all_pending_orders(mt5_api, symbol, logger=None):
             else:
                 if logger:
                     logger.info(f"✅ Cancelled pending order {ticket} for {symbol}")
-                    telegramBot.send_message(f"✅ Cancelled pending order {ticket} for {symbol}", chat_id=TELEGRAM_CHAT_ID)
+                    # telegramBot.send_message(f"✅ Cancelled pending order {ticket} for {symbol}", chat_id=TELEGRAM_CHAT_ID)
     except Exception as e:
         if logger:
             logger.error(f"Error cancelling all pending orders: {e}")
@@ -490,7 +510,7 @@ def cancel_all_pending_orders(mt5_api, symbol, logger=None):
 def main():
     global gDetailOrders, gCurrentIdx
     global gStartBalance
-    global notified_filled
+    global gNotifiedFilled
     
     logging.basicConfig(
         level=logging.INFO,
@@ -525,7 +545,7 @@ def main():
         # Step 1: Close all existing positions and pending orders for the symbol
         run_at_index(mt5.mt5, symbol, trade_amount, index=gCurrentIdx, price=0, logger=logger)
         
-        notified_filled = set()
+        gNotifiedFilled = set()
         notified_tp = set()
         closed_pnl = 0
         # Step 6: Monitor and notify if order filled or TP filled
@@ -553,7 +573,7 @@ def main():
                 
                 # check if Pending order filled
                 for oid in saved_orders:
-                    if oid not in notified_filled:
+                    if oid not in gNotifiedFilled:
                         if check_pending_order_filled(history, oid, logger):
                             # Determine side from comment
                             order_comment = None
@@ -574,13 +594,19 @@ def main():
                             else:
                                 side = '?'
                             logger.info(f"🔥 :: {order_comment} :: Pending order filled: ID {oid} | {side} | {order_price}")
-                            notified_filled.add(oid)
-                            logger.info(f"Filled order IDs: {notified_filled}")
-                            telegramBot.send_message(f"🔥 :: {order_comment} :: Pending order filled: ID {oid} | {side} | {order_price}", chat_id=TELEGRAM_CHAT_ID  )
+                            gNotifiedFilled.add(oid)
+                            logger.info(f"Filled order IDs: {gNotifiedFilled}")
+                            
+                            all_status_report = get_all_order_status_str(logger=logger)
+                            msg = f"🔥 <b>Pending order filled - {order_comment}</b>\n"
+                            msg += f"ID {oid} | {side} | {order_price:<.2f}\n"
+                            msg += f"\n"
+                            msg += f"{all_status_report}"
+                            telegramBot.send_message(msg, chat_id=TELEGRAM_CHAT_ID)
                             run_at_index(mt5.mt5, symbol, trade_amount, gCurrentIdx, price=order_price, logger=logger)
                         
                 # check if Position closed (TP filled)
-                for oid in notified_filled:
+                for oid in gNotifiedFilled:
                     if oid not in notified_tp:
                         if check_position_closed(mt5.mt5, oid, logger):
                             pnl = pos_closed_pnl(mt5.mt5, oid, logger)
@@ -619,7 +645,12 @@ def main():
                             logger.info(f"❤️ :: {order_comment} :: TP filled: Position ID {oid} closed | P&L: ${pnl:.2f} All Closed P&L: ${closed_pnl:.2f}")
                             logger.info(f"TP filled order IDs: {notified_tp}")
                             logger.info(f"TP filled: {hit_side} order index {gCurrentIdx} (ID {oid}) closed. TP price: {hit_tp_price}")
-                            telegramBot.send_message(f"❤️❤️❤️ :: {order_comment} :: TP filled: Position ID {oid} closed \nP&L: ${pnl:.2f}\n All Closed P&L: ${closed_pnl:.2f} \nAll P&L: ${closed_pnl + open_pnl:.2f}", chat_id=TELEGRAM_CHAT_ID)
+                            msg = f"❤️❤️❤️ <b>TP filled - {order_comment}</b>\n\n"
+                            msg += f"<b>Position ID:</b> {oid}\n"
+                            msg += f"<b>P&L:</b> ${pnl:.2f}\n"
+                            msg += f"<b>All Closed P&L:</b> ${closed_pnl:.2f}\n"
+                            msg += f"<b>All P&L:</b> ${closed_pnl + open_pnl:.2f}\n"
+                            telegramBot.send_message(msg, chat_id=TELEGRAM_CHAT_ID)
                             run_at_index(mt5.mt5, symbol, trade_amount, gCurrentIdx, price=0, logger=logger)
                             # delete gDetailOrders
                             logger.info(f"⚠️ :: Deleting gDetailOrders entry for {hit_side.lower()}_{hit_index}")
@@ -636,11 +667,6 @@ def main():
                     # Get current balance
                     close_all_positions(mt5.mt5, symbol, logger)
                     cancel_all_pending_orders(mt5.mt5, symbol, logger)
-                    gDetailOrders = {key: {'status': None} for key in gDetailOrders.keys()}
-                    notified_filled.clear()
-                    notified_tp.clear()
-                    closed_pnl = 0
-                    gCurrentIdx = 0
                     
                     current_balance = get_current_balance(mt5.mt5, logger=logger)
                     
@@ -658,6 +684,11 @@ def main():
                         f"Run time: {run_time_str}"
                     )
 
+                    gDetailOrders = {key: {'status': None} for key in gDetailOrders.keys()}
+                    gNotifiedFilled.clear()
+                    notified_tp.clear()
+                    gCurrentIdx = 0
+                    closed_pnl = 0
                     logger.info(msg)
                     telegramBot.send_message(msg, chat_id=TELEGRAM_CHAT_ID, pin_msg=True)
 
@@ -672,14 +703,10 @@ def main():
                         logger.warning(f"⚠️ Open orders remain after TP: {open_orders_left}")
                         telegramBot.send_message(f"⚠️ Open orders remain after TP: {open_orders_left}", chat_id=TELEGRAM_CHAT_ID)
 
-                    run_at_index(mt5.mt5, symbol, trade_amount, gCurrentIdx, price=0, logger=logger)
-                    notified_filled.clear()
-                    notified_tp.clear()
-                    closed_pnl = 0
-                    gCurrentIdx = 0
                     script_start_time  = datetime.now()
                     start_balance = get_current_balance(mt5.mt5, logger=logger)
                     gStartBalance = start_balance
+                    run_at_index(mt5.mt5, symbol, trade_amount, gCurrentIdx, price=0, logger=logger)
                     
                 time.sleep(0.5)
         except KeyboardInterrupt:
