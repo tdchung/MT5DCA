@@ -23,8 +23,8 @@ if src_path not in sys.path:
 
 
 ################################################################################################
-TELEGRAM_API_TOKEN = f"5512013694:AAFuHGyI08lJVHNq4-7wkOEhEYgPWrZEvao"
-TELEGRAM_BOT_NAME = "@DawnStarControlBot"
+TELEGRAM_API_TOKEN = f"8279248250:AAE4Qgvop7tdED6Ya8Ot5HVC1_6Q6mrOjac"
+TELEGRAM_BOT_NAME = "@mt5_159684431_bot"
 TELEGRAM_CHAT_ID = "1661018465"
 
 telegramBot = TelegramBot(TELEGRAM_API_TOKEN, TELEGRAM_BOT_NAME)
@@ -33,17 +33,17 @@ telegramBot = TelegramBot(TELEGRAM_API_TOKEN, TELEGRAM_BOT_NAME)
 # FIBONACCI_LEVELS = [1, 1, 2, 3, 5, 8, 13, 21, 34]
 FIBONACCI_LEVELS = [1, 1, 2, 2, 3, 3, 5, 8, 13, 13, 13, 13, 13]
 
-CONFIG_FILE = f"config/mt5_config_257129243.json"
+CONFIG_FILE = f"config/mt5_config_159684431.json"
 
 TRADE_SYMBOL = "XAUUSDc"
 # TRADE_SYMBOL = "XAUUSD"
-DELTA_ENTER_PRICE = 0.7
-TARGET_PROFIT = 2.0
+DELTA_ENTER_PRICE = 0.55
+TARGET_PROFIT = 2.1
 
-TRADE_AMOUNT = 0.09
-TP_EXPECTED    = 90
+TRADE_AMOUNT = 0.02
+TP_EXPECTED    = 20
 
-PERCENT_SCALE = 12  # Percent scale factor for grid spacing (used as: percent = abs(index)/100 * PERCENT_SCALE)
+PERCENT_SCALE = 10  # Percent scale factor for grid spacing (used as: percent = abs(index)/100 * PERCENT_SCALE)
 MAX_REDUCE_BALANCE = 8000  # Max balance reduction before stopping the script
 MIN_FREE_MARGIN = 100  # Minimum free margin to continue trading
 
