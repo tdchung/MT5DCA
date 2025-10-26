@@ -28,7 +28,7 @@ class TelegramBot:
 
         self.bot = Bot(token=self.token)
         
-    def send_message(self, msg, chat_id=None, symbol=None, reply_to_message_id=None, pin_msg=False):
+    def send_message(self, msg, chat_id=None, symbol=None, reply_to_message_id=None, pin_msg=False, disable_notification=True):
         """
         Send a message in a separate thread. If reply_to_message_id is provided, send as a thread (reply).
         """
@@ -41,7 +41,8 @@ class TelegramBot:
                         text=msg,
                         parse_mode=ParseMode.HTML,
                         reply_markup=keyboards,
-                        reply_to_message_id=reply_to_message_id
+                        reply_to_message_id=reply_to_message_id,
+                        disable_notification=disable_notification
                     )
                     log(res)
                     if pin_msg:
@@ -56,7 +57,8 @@ class TelegramBot:
                 text=msg,
                 parse_mode=ParseMode.HTML,
                 reply_markup=keyboards,
-                reply_to_message_id=reply_to_message_id
+                reply_to_message_id=reply_to_message_id,
+                disable_notification=disable_notification
             )
             log(res)
             if pin_msg:

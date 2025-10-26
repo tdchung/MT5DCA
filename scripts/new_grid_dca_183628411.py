@@ -691,7 +691,7 @@ def main():
                     gCurrentIdx = 0
                     closed_pnl = 0
                     logger.info(msg)
-                    telegramBot.send_message(msg, chat_id=TELEGRAM_CHAT_ID, pin_msg=True)
+                    telegramBot.send_message(msg, chat_id=TELEGRAM_CHAT_ID, pin_msg=True, disable_notification=False)
 
                     # Check if any open positions or open orders remain
                     positions_left = mt5.get_positions()

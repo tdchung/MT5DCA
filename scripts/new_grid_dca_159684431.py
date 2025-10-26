@@ -10,7 +10,7 @@ import logging
 import sys
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from mt5_connector import MT5Connection
 from config_manager import ConfigManager
@@ -40,13 +40,14 @@ TRADE_SYMBOL = "XAUUSDc"
 DELTA_ENTER_PRICE = 0.55
 TARGET_PROFIT = 2.1
 
-TRADE_AMOUNT = 0.02
-TP_EXPECTED    = 20
+TRADE_AMOUNT = 0.05
+TP_EXPECTED    = 50
 
-PERCENT_SCALE = 10  # Percent scale factor for grid spacing (used as: percent = abs(index)/100 * PERCENT_SCALE)
-MAX_REDUCE_BALANCE = 8000  # Max balance reduction before stopping the script
-MIN_FREE_MARGIN = 100  # Minimum free margin to continue trading
+PERCENT_SCALE           = 11  # Percent scale factor for grid spacing (used as: percent = abs(index)/100 * PERCENT_SCALE)
+MAX_REDUCE_BALANCE      = 3000  # Max balance reduction before stopping the script
+MIN_FREE_MARGIN         = 100  # Minimum free margin to continue trading
 
+gTpExpected = TP_EXPECTED
 gDetailOrders = {
     'buy_9': {'status': None},
     'sell_9': {'status': None},
@@ -191,7 +192,6 @@ def place_pending_order(mt5_api, symbol, order_type, price, tp_price, volume=0.0
         return None
     if result.retcode != mt5_api.TRADE_RETCODE_DONE:
         if logger:
-            # logger.error(f"⭕️ :: {comment} :: Order failed, retcode: {result.retcode}, comment: {result.comment}")
             telegramBot.send_message(
                 f"⭕️ :: {comment} :: Order failed, retcode: {result.retcode}, comment: {result.comment}",
                 chat_id=TELEGRAM_CHAT_ID,
@@ -200,7 +200,6 @@ def place_pending_order(mt5_api, symbol, order_type, price, tp_price, volume=0.0
     order_type_str = "BUY STOP" if order_type == mt5_api.ORDER_TYPE_BUY_STOP else "SELL STOP"
     if logger:
         logger.info(f"✅ :: {comment} :: {order_type_str} order placed: {volume} lots at {price:.2f}, TP: {tp_price:.2f}")
-        # telegramBot.send_message(f"✅ :: {comment} :: {order_type_str} order placed: {volume} lots at {price:.2f}, TP: {tp_price:.2f}", chat_id=TELEGRAM_CHAT_ID)
     return result
 
 
@@ -511,6 +510,7 @@ def main():
     global gDetailOrders, gCurrentIdx
     global gStartBalance
     global gNotifiedFilled
+    global gTpExpected
     
     logging.basicConfig(
         level=logging.INFO,
@@ -524,6 +524,7 @@ def main():
         credentials = config.get_mt5_credentials()
         symbol = TRADE_SYMBOL
         trade_amount = TRADE_AMOUNT
+        gTpExpected = trade_amount * 1000 # Adjusted TP expected based on trade amount
         mt5 = MT5Connection(
             login=credentials['login'],
             password=credentials['password'],
@@ -663,7 +664,7 @@ def main():
                     logger.info(f"gCurrentIdx: {gCurrentIdx}")
                 
 
-                if closed_pnl + open_pnl > TP_EXPECTED:
+                if closed_pnl + open_pnl > gTpExpected:
                     # Get current balance
                     close_all_positions(mt5.mt5, symbol, logger)
                     cancel_all_pending_orders(mt5.mt5, symbol, logger)
@@ -690,7 +691,21 @@ def main():
                     gCurrentIdx = 0
                     closed_pnl = 0
                     logger.info(msg)
-                    telegramBot.send_message(msg, chat_id=TELEGRAM_CHAT_ID, pin_msg=True)
+                    telegramBot.send_message(msg, chat_id=TELEGRAM_CHAT_ID, pin_msg=True, disable_notification=False)
+
+                    # Update trade amount based on time (GMT+7 timezone)
+                    gmt_plus_7 = timezone(timedelta(hours=7))
+                    current_time_gmt7 = datetime.now(gmt_plus_7)
+                    current_hour = current_time_gmt7.hour
+                    
+                    if 19 <= current_hour <= 23:  # 7 PM to 11 PM GMT+7
+                        trade_amount = round(TRADE_AMOUNT / 2, 2)
+                        gTpExpected = trade_amount * 1000 # Adjusted TP expected based on trade amount
+                        logger.info(f"🕰️ Time-based adjustment: Reduced trade amount to {trade_amount} (GMT+7: {current_hour}:00)")
+                        telegramBot.send_message(f"🕰️ Time-based adjustment: Reduced trade amount to {trade_amount} during high-risk hours ({current_hour}:00 GMT+7)", chat_id=TELEGRAM_CHAT_ID)
+                    else:
+                        trade_amount = TRADE_AMOUNT
+                        logger.info(f"🕰️ Normal trade amount: {trade_amount} (GMT+7: {current_hour}:00)")
 
                     # Check if any open positions or open orders remain
                     positions_left = mt5.get_positions()
