@@ -390,24 +390,34 @@ def close_all_positions(mt5_api, symbol, logger=None):
             if logger:
                 logger.info(f"No open positions to close for {symbol}.")
             return
+        
         # Collect all order IDs from gDetailOrders with status 'placed'
-        order_ids = set()
+        strategy_order_ids = set()
         for key, val in gDetailOrders.items():
             if val.get('status') == 'placed' and val.get('order') is not None:
                 order_obj = val['order']
                 oid = getattr(order_obj, 'order', None)
                 if oid is not None:
-                    order_ids.add(oid)
+                    strategy_order_ids.add(oid)
+        
+        positions_closed = 0
         for pos in positions:
             ticket = getattr(pos, 'ticket', None)
             volume = getattr(pos, 'volume', None)
             type_ = getattr(pos, 'type', None)
+            magic = getattr(pos, 'magic', None)
+            
             if ticket is None or volume is None or type_ is None:
                 if logger:
                     logger.warning(f"Could not get ticket/volume/type for position: {pos}")
                 continue
-            # Only close positions matching gDetailOrders
-            # if ticket not in order_ids:
+            
+            # Only close positions that belong to this strategy
+            # Check both magic number and if position ID is in our tracked orders
+            # if magic != 234002 and ticket not in strategy_order_ids:
+            # if ticket not in strategy_order_ids:
+            #     if logger:
+            #         logger.debug(f"Skipping position {ticket} - not from this strategy (magic: {magic})")
             #     continue
             
             # Determine close type
@@ -419,6 +429,7 @@ def close_all_positions(mt5_api, symbol, logger=None):
                 if logger:
                     logger.warning(f"Unknown position type for ticket {ticket}: {type_}")
                 continue
+            
             # Try supported filling modes
             filling_modes = [mt5_api.ORDER_FILLING_IOC, mt5_api.ORDER_FILLING_FOK, mt5_api.ORDER_FILLING_RETURN]
             success = False
@@ -431,7 +442,7 @@ def close_all_positions(mt5_api, symbol, logger=None):
                     "position": ticket,
                     "deviation": 20,
                     "magic": 234002,
-                    "comment": f"close_all_positions (mode {fill_mode})",
+                    "comment": f"close_strategy_positions",
                     "type_time": mt5_api.ORDER_TIME_GTC,
                     "type_filling": fill_mode,
                 }
@@ -441,7 +452,8 @@ def close_all_positions(mt5_api, symbol, logger=None):
                         logger.error(f"Failed to close position {ticket} (mode {fill_mode}): {mt5_api.last_error()}")
                 elif result.retcode == mt5_api.TRADE_RETCODE_DONE:
                     if logger:
-                        logger.info(f"✅ Closed position {ticket} for {symbol}, volume {volume} (mode {fill_mode})")
+                        logger.info(f"✅ Closed strategy position {ticket} for {symbol}, volume {volume} (mode {fill_mode})")
+                    positions_closed += 1
                     success = True
                     break
                 else:
@@ -449,9 +461,13 @@ def close_all_positions(mt5_api, symbol, logger=None):
                         logger.error(f"Failed to close position {ticket} (mode {fill_mode}): retcode {result.retcode}, comment: {result.comment}")
             if not success and logger:
                 logger.error(f"❌ Could not close position {ticket} for {symbol} with any supported filling mode.")
+        
+        if logger:
+            logger.info(f"Strategy positions closed: {positions_closed} out of {len(positions)} total positions for {symbol}")
+            
     except Exception as e:
         if logger:
-            logger.error(f"Error closing all positions: {e}")
+            logger.error(f"Error closing strategy positions: {e}")
 
 
 def cancel_all_pending_orders(mt5_api, symbol, logger=None):
@@ -461,22 +477,31 @@ def cancel_all_pending_orders(mt5_api, symbol, logger=None):
             if logger:
                 logger.info(f"No pending orders to cancel for {symbol}.")
             return
+            
         # Collect all order IDs from gDetailOrders with status 'placed'
-        order_ids = set()
+        strategy_order_ids = set()
         for key, val in gDetailOrders.items():
             if val.get('status') == 'placed' and val.get('order') is not None:
                 order_obj = val['order']
                 oid = getattr(order_obj, 'order', None)
                 if oid is not None:
-                    order_ids.add(oid)
+                    strategy_order_ids.add(oid)
+        
+        orders_cancelled = 0
         for order in orders:
             ticket = getattr(order, 'ticket', None)
+            magic = getattr(order, 'magic', None)
+            
             if ticket is None:
                 if logger:
                     logger.warning(f"Could not get ticket for order: {order}")
                 continue
-            # Only cancel pending orders matching gDetailOrders
-            # if ticket not in order_ids:
+            
+            # Only cancel pending orders that belong to this strategy
+            # Check both magic number and if order ID is in our tracked orders
+            # if magic != 234002 and ticket not in strategy_order_ids:
+            #     if logger:
+            #         logger.debug(f"Skipping order {ticket} - not from this strategy (magic: {magic})")
             #     continue
             
             request = {
@@ -484,7 +509,7 @@ def cancel_all_pending_orders(mt5_api, symbol, logger=None):
                 "order": ticket,
                 "symbol": symbol,
                 "magic": 234002,
-                "comment": "cancel_all_pending_orders",
+                "comment": "cancel_strategy_orders",
             }
             result = mt5_api.order_send(request)
             if result is None:
@@ -495,11 +520,16 @@ def cancel_all_pending_orders(mt5_api, symbol, logger=None):
                     logger.error(f"Failed to cancel pending order {ticket}: retcode {result.retcode}, comment: {result.comment}")
             else:
                 if logger:
-                    logger.info(f"✅ Cancelled pending order {ticket} for {symbol}")
+                    logger.info(f"✅ Cancelled strategy order {ticket} for {symbol}")
+                orders_cancelled += 1
                     # telegramBot.send_message(f"✅ Cancelled pending order {ticket} for {symbol}", chat_id=TELEGRAM_CHAT_ID)
+        
+        if logger:
+            logger.info(f"Strategy orders cancelled: {orders_cancelled} out of {len(orders)} total orders for {symbol}")
+            
     except Exception as e:
         if logger:
-            logger.error(f"Error cancelling all pending orders: {e}")
+            logger.error(f"Error cancelling strategy orders: {e}")
 
 
 ###############################################################################################################
