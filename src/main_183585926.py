@@ -53,49 +53,27 @@ telegramBot = TelegramBot(TELEGRAM_API_TOKEN, TELEGRAM_BOT_NAME) if TELEGRAM_API
 
 gTpExpected = 0
 gDetailOrders = {
-    'buy_9': {'status': None},
-    'sell_9': {'status': None},
-    'buy_8': {'status': None},
-    'sell_8': {'status': None},
-    'buy_7': {'status': None},
-    'sell_7': {'status': None},
-    'buy_6': {'status': None},
-    'sell_6': {'status': None},
-    'buy_5': {'status': None},
-    'sell_5': {'status': None},
-    'buy_4': {'status': None},
-    'sell_4': {'status': None},
-    'buy_3': {'status': None},
-    'sell_3': {'status': None},
-    'buy_2': {'status': None},
-    'sell_2': {'status': None},
-    'buy_1': {'status': None},
-    'sell_1': {'status': None},
-    'buy_0': {'status': None},
-    'sell_0': {'status': None},
-    'buy_-1': {'status': None},
-    'sell_-1': {'status': None},
-    'buy_-2': {'status': None},
-    'sell_-2': {'status': None},
-    'buy_-3': {'status': None},
-    'sell_-3': {'status': None},
-    'buy_-4': {'status': None},
-    'sell_-4': {'status': None},
-    'buy_-5': {'status': None},
-    'sell_-5': {'status': None},
-    'buy_-6': {'status': None},
-    'sell_-6': {'status': None},
-    'buy_-7': {'status': None},
-    'sell_-7': {'status': None},
-    'buy_-8': {'status': None},
-    'sell_-8': {'status': None},
-    'buy_-9': {'status': None},
-    'sell_-9': {'status': None},
 }
 gCurrentIdx = 0
 gStartBalance = 0
 gMaxDrawdown = 0
 gNotifiedFilled = set()
+gBotPaused = False  # Flag to control bot pause state
+gStopRequested = False  # Flag to indicate /stop command received
+gNextTradeAmount = None  # New trade amount to use for next run
+gQuietHoursEnabled = True
+gQuietHoursStart = 19
+gQuietHoursEnd = 23
+gQuietHoursFactor = 0.5  # Reduce to 50% during quiet hours
+gSessionStartTime = None  # Tracks current run/session start time for status
+gMaxDDThreshold = None  # Auto-pause drawdown threshold (account currency)
+gMaxPositions = None  # Max concurrent strategy positions
+gMaxOrders = None  # Max concurrent strategy pending orders
+gMaxSpread = None  # Max allowed spread (price units)
+gBlackoutEnabled = False
+gBlackoutStart = 0
+gBlackoutEnd = 0
+gStopAtDateTime = None  # Scheduled pause time (GMT+7)
 
 ################################################################################################
 def check_pending_order_filled(history, order_id, logger=None):
@@ -267,12 +245,124 @@ def get_all_order_status_str(logger=None):
     return all_status_report
 
 ###############################################################################################################
+def get_filled_orders_list(logger=None):
+    """
+    Build a list of strategy orders that have been filled (based on gNotifiedFilled).
+    Returns dicts with: key, comment, order_id, side, index, price, volume.
+    """
+    global gDetailOrders, gNotifiedFilled
+    filled_orders = []
+    try:
+        for key, val in gDetailOrders.items():
+            if val and val.get('order') is not None:
+                order_obj = val['order']
+                order_id = getattr(order_obj, 'order', None)
+                if order_id and order_id in gNotifiedFilled:
+                    order_comment = getattr(order_obj, 'comment', key)
+                    order_price = getattr(order_obj.request, 'price', None)
+                    order_volume = getattr(order_obj.request, 'volume', None)
+                    side = 'BUY' if 'buy' in key.lower() else 'SELL'
+                    try:
+                        index = int(key.split('_')[-1])
+                    except Exception:
+                        index = None
+                    filled_order_info = {
+                        'key': key,
+                        'comment': order_comment,
+                        'order_id': order_id,
+                        'side': side,
+                        'index': index,
+                        'price': round(order_price, 3) if order_price else None,
+                        'volume': round(order_volume, 2) if order_volume else None,
+                    }
+                    filled_orders.append(filled_order_info)
+        filled_orders.sort(key=lambda x: (x['side'], x['index'] if x['index'] is not None else 0))
+        if logger:
+            logger.info(f"Found {len(filled_orders)} filled orders")
+    except Exception as e:
+        if logger:
+            logger.error(f"Error getting filled orders list: {e}")
+    return filled_orders
+
+def get_filled_orders_summary(logger=None):
+    """
+    Produce a human-readable summary of filled orders grouped by side.
+    """
+    filled_orders = get_filled_orders_list(logger)
+    if not filled_orders:
+        return "No filled orders found."
+    summary_lines = []
+    summary_lines.append(f"📋 <b>Filled Orders Summary ({len(filled_orders)} orders)</b>\n")
+    buy_orders = [o for o in filled_orders if o['side'] == 'BUY']
+    sell_orders = [o for o in filled_orders if o['side'] == 'SELL']
+    if buy_orders:
+        summary_lines.append("🟢 <b>BUY Orders Filled:</b>")
+        for o in buy_orders:
+            summary_lines.append(f"  • {o['comment']} | Price: {o['price']} | Vol: {o['volume']}")
+        summary_lines.append("")
+    if sell_orders:
+        summary_lines.append("🔴 <b>SELL Orders Filled:</b>")
+        for o in sell_orders:
+            summary_lines.append(f"  • {o['comment']} | Price: {o['price']} | Vol: {o['volume']}")
+    return '\n'.join(summary_lines)
+
+def check_consecutive_orders_pattern(logger=None):
+    """
+    Detect consecutive filled-order patterns by index progression within each side.
+    Returns dict with: consecutive_buys, consecutive_sells, pattern_detected, total_filled.
+    """
+    filled_orders = get_filled_orders_list(logger)
+    if len(filled_orders) < 2:
+        return {"consecutive_buys": [], "consecutive_sells": [], "pattern_detected": False, "total_filled": 0}
+    buy_orders = sorted([o for o in filled_orders if o['side'] == 'BUY'], key=lambda x: x['index'] if x['index'] is not None else 0)
+    sell_orders = sorted([o for o in filled_orders if o['side'] == 'SELL'], key=lambda x: x['index'] if x['index'] is not None else 0)
+    consecutive_buys = []
+    consecutive_sells = []
+    for i in range(len(buy_orders) - 1):
+        if (buy_orders[i]['index'] is not None and buy_orders[i+1]['index'] is not None and buy_orders[i+1]['index'] == buy_orders[i]['index'] + 1):
+            consecutive_buys.append((buy_orders[i], buy_orders[i+1]))
+    for i in range(len(sell_orders) - 1):
+        if (sell_orders[i]['index'] is not None and sell_orders[i+1]['index'] is not None and sell_orders[i+1]['index'] == sell_orders[i]['index'] - 1):
+            consecutive_sells.append((sell_orders[i], sell_orders[i+1]))
+    pattern_detected = len(consecutive_buys) > 0 or len(consecutive_sells) > 0
+    if logger and pattern_detected:
+        logger.info(f"Consecutive patterns detected - Buys: {len(consecutive_buys)}, Sells: {len(consecutive_sells)}")
+    return {
+        "consecutive_buys": consecutive_buys,
+        "consecutive_sells": consecutive_sells,
+        "pattern_detected": pattern_detected,
+        "total_filled": len(filled_orders),
+    }
+
+###############################################################################################################
 def run_at_index(mt5_api, symbol, amount, index, price=0, logger=None):
     global gDetailOrders
     global gStartBalance
     global gNotifiedFilled
+    global gBlackoutEnabled, gBlackoutStart, gBlackoutEnd
+    global gMaxPositions, gMaxOrders, gMaxSpread
 
     try:
+        # Blackout check (GMT+7)
+        gmt_plus_7 = timezone(timedelta(hours=7))
+        now_gmt7 = datetime.now(gmt_plus_7)
+        current_hour = now_gmt7.hour
+        in_blackout = (
+            gBlackoutEnabled and (
+                (gBlackoutStart <= gBlackoutEnd and gBlackoutStart <= current_hour <= gBlackoutEnd) or
+                (gBlackoutStart > gBlackoutEnd and (current_hour >= gBlackoutStart or current_hour <= gBlackoutEnd))
+            )
+        )
+        if in_blackout:
+            if logger:
+                logger.info(f"⛔️ Blackout window active {gBlackoutStart:02d}-{gBlackoutEnd:02d} GMT+7. Skipping grid build.")
+            if telegramBot:
+                telegramBot.send_message(
+                    f"⛔️ Blackout window active {gBlackoutStart:02d}-{gBlackoutEnd:02d} GMT+7. Skipping grid build.",
+                    chat_id=TELEGRAM_CHAT_ID,
+                )
+            return
+
         current_balance = get_current_balance(mt5_api, logger=logger)
         current_equity = get_current_equity(mt5_api, logger=logger)
         current_fee_margin = get_current_free_margin(mt5_api, logger=logger)
@@ -294,6 +384,20 @@ def run_at_index(mt5_api, symbol, amount, index, price=0, logger=None):
             if logger:
                 logger.error(f"Could not get tick for {symbol}")
             return
+        # Spread cap
+        try:
+            spread = (tick.ask - tick.bid) if (hasattr(tick, 'ask') and hasattr(tick, 'bid')) else 0.0
+        except Exception:
+            spread = 0.0
+        if gMaxSpread is not None and spread > gMaxSpread:
+            if logger:
+                logger.info(f"⛔️ Spread {spread:.3f} > max {gMaxSpread:.3f}. Skipping grid build.")
+            if telegramBot:
+                telegramBot.send_message(
+                    f"⛔️ Spread {spread:.3f} > max {gMaxSpread:.3f}. Skipping grid build.",
+                    chat_id=TELEGRAM_CHAT_ID,
+                )
+            return
 
         # price = tick.ask if tick.ask else tick.last
         if not price:
@@ -306,6 +410,32 @@ def run_at_index(mt5_api, symbol, amount, index, price=0, logger=None):
         percent2 = abs(index + 2) / 100 * PERCENT_SCALE
         percent_1 = abs(index - 1) / 100 * PERCENT_SCALE
         percent_2 = abs(index - 2) / 100 * PERCENT_SCALE
+
+        # Pattern-based exposure adjustment using consecutive filled orders
+        pypass_buy1 = False
+        pypass_sell1 = False
+        try:
+            pattern_data = check_consecutive_orders_pattern(logger)
+            if pattern_data.get('pattern_detected'):
+                if len(pattern_data.get('consecutive_buys', [])) >= 2:
+                    if logger:
+                        logger.warning("⚠️ Strong upward trend detected - consider reducing BUY exposure")
+                        telegramBot.send_message(
+                            "⚠️ Strong upward trend detected - consider reducing BUY exposure",
+                            chat_id=TELEGRAM_CHAT_ID,
+                        )
+                    pypass_sell1 = True
+                if len(pattern_data.get('consecutive_sells', [])) >= 2:
+                    if logger:
+                        logger.warning("⚠️ Strong downward trend detected - consider reducing SELL exposure")
+                        telegramBot.send_message(
+                            "⚠️ Strong downward trend detected - consider reducing SELL exposure",
+                            chat_id=TELEGRAM_CHAT_ID,
+                        )
+                    pypass_buy1 = True
+        except Exception as e:
+            if logger:
+                logger.debug(f"consecutive pattern check error: {e}")
 
         # Calculate buy stop entries and TP
         buy_entry_1 = price + DELTA_ENTER_PRICE * (1 + percent0)
@@ -332,6 +462,33 @@ def run_at_index(mt5_api, symbol, amount, index, price=0, logger=None):
         fibs_amount_2 = amount * FIBONACCI_LEVELS[abs(index-1)] if abs(index-1) < len(FIBONACCI_LEVELS) else amount
         fibs_amount_3 = amount * FIBONACCI_LEVELS[abs(index-2)] if abs(index-2) < len(FIBONACCI_LEVELS) else amount
 
+        # Capacity caps for positions/orders
+        try:
+            # Count strategy positions
+            pos_count = 0
+            for p in (mt5_api.positions_get(symbol=symbol) or []):
+                if getattr(p, 'magic', None) == 234002:
+                    pos_count += 1
+            # Count strategy pending orders
+            ord_count = 0
+            for o in (mt5_api.orders_get(symbol=symbol) or []):
+                if getattr(o, 'magic', None) == 234002:
+                    ord_count += 1
+            if (gMaxPositions is not None and pos_count >= gMaxPositions) or (
+                gMaxOrders is not None and ord_count >= gMaxOrders
+            ):
+                if logger:
+                    logger.info(f"⛔️ Capacity cap reached (pos {pos_count}/{gMaxPositions or '∞'}, orders {ord_count}/{gMaxOrders or '∞'}). Skipping grid build.")
+                if telegramBot:
+                    telegramBot.send_message(
+                        f"⛔️ Capacity cap reached (pos {pos_count}/{gMaxPositions or '∞'}, orders {ord_count}/{gMaxOrders or '∞'}). Skipping grid build.",
+                        chat_id=TELEGRAM_CHAT_ID,
+                    )
+                return
+        except Exception as e:
+            if logger:
+                logger.debug(f"Capacity cap check error: {e}")
+
         # Place buy stop orders only if not already placed
         buy_comment_1 = f"buy_{index}"
         buy_comment_2 = f"buy_{index+1}"
@@ -343,15 +500,17 @@ def run_at_index(mt5_api, symbol, amount, index, price=0, logger=None):
 
         new_orders = []
         if gDetailOrders.get(buy_comment_1, {}).get('status') != 'placed':
-            res_buy_1 = place_pending_order(mt5_api, symbol, mt5_api.ORDER_TYPE_BUY_STOP, buy_entry_1, buy_tp_1, fibb_amount_1, buy_comment_1, logger)
-            if res_buy_1:
-                gDetailOrders[buy_comment_1] = {'status': 'placed', 'order': res_buy_1}
-                new_orders.append(res_buy_1)
+            if not pypass_buy1:
+                res_buy_1 = place_pending_order(mt5_api, symbol, mt5_api.ORDER_TYPE_BUY_STOP, buy_entry_1, buy_tp_1, fibb_amount_1, buy_comment_1, logger)
+                if res_buy_1:
+                    gDetailOrders[buy_comment_1] = {'status': 'placed', 'order': res_buy_1}
+                    new_orders.append(res_buy_1)
         if gDetailOrders.get(sell_comment_1, {}).get('status') != 'placed':
-            res_sell_1 = place_pending_order(mt5_api, symbol, mt5_api.ORDER_TYPE_SELL_STOP, sell_entry_1, sell_tp_1, fibs_amount_1, sell_comment_1, logger)
-            if res_sell_1:
-                gDetailOrders[sell_comment_1] = {'status': 'placed', 'order': res_sell_1}
-                new_orders.append(res_sell_1)
+            if not pypass_sell1:
+                res_sell_1 = place_pending_order(mt5_api, symbol, mt5_api.ORDER_TYPE_SELL_STOP, sell_entry_1, sell_tp_1, fibs_amount_1, sell_comment_1, logger)
+                if res_sell_1:
+                    gDetailOrders[sell_comment_1] = {'status': 'placed', 'order': res_sell_1}
+                    new_orders.append(res_sell_1)
 
         if gDetailOrders.get(buy_comment_2, {}).get('status') != 'placed':
             res_buy_2 = place_pending_order(mt5_api, symbol, mt5_api.ORDER_TYPE_BUY_STOP, buy_entry_2, buy_tp_2, fibb_amount_2, buy_comment_2, logger)
@@ -530,6 +689,659 @@ def drawdown_report():
     return msg
 
 
+###############################################################################################################
+def handle_telegram_command(bot, mt5_api=None, logger=None):
+    """
+    Handle incoming Telegram commands
+    """
+    global gBotPaused
+    global gStopRequested
+    global gNextTradeAmount
+    global gQuietHoursEnabled, gQuietHoursStart, gQuietHoursEnd, gQuietHoursFactor
+    global gSessionStartTime
+    global gMaxDDThreshold, gMaxPositions, gMaxOrders, gMaxSpread
+    global gBlackoutEnabled, gBlackoutStart, gBlackoutEnd, gStopAtDateTime
+    
+    try:
+        # Get updates from Telegram
+        updates = bot.bot.get_updates(timeout=1)
+        
+        for update in updates:
+            if update.message and update.message.text:
+                chat_id = update.message.chat.id
+                text = update.message.text.strip()
+                
+                if logger:
+                    logger.info(f"Received Telegram command: {text} from chat_id: {chat_id}")
+                
+                # Handle /start command
+                if text == '/start':
+                    # Get account number
+                    account_number = "N/A"
+                    if mt5_api:
+                        try:
+                            acc_info = mt5_api.account_info()
+                            if acc_info and hasattr(acc_info, 'login'):
+                                account_number = acc_info.login
+                        except Exception as e:
+                            if logger:
+                                logger.debug(f"Could not get account info: {e}")
+                    
+                    # Resume bot if it was paused
+                    if gBotPaused:
+                        gBotPaused = False
+                        gStopRequested = False
+                        resume_msg = f"▶️ <b>Bot Resumed!</b>\n\n"
+                        resume_msg += f"• Account: {account_number}\n"
+                        resume_msg += f"• Symbol: {TRADE_SYMBOL}\n"
+                        resume_msg += f"• Trade Amount: {TRADE_AMOUNT}\n"
+                        resume_msg += f"• Status: Running ✅\n\n"
+                        resume_msg += f"The bot will now resume trading operations."
+                        
+                        bot.send_message(resume_msg, chat_id=chat_id, disable_notification=False)
+                        
+                        if logger:
+                            logger.info(f"Bot resumed by user command from chat_id: {chat_id}")
+                    else:
+                        welcome_msg = f"👋 <b>Hello!</b>\n\n"
+                        welcome_msg += f"• Account: {account_number}\n\n"
+                        welcome_msg += f"Welcome to the Grid DCA Trading Bot for {TRADE_SYMBOL}!\n\n"
+                        welcome_msg += f"<b>Bot Status:</b>\n"
+                        welcome_msg += f"• Strategy: Grid DCA\n"
+                        welcome_msg += f"• Symbol: {TRADE_SYMBOL}\n"
+                        welcome_msg += f"• Trade Amount: {TRADE_AMOUNT}\n"
+                        welcome_msg += f"• Status: Running ✅\n\n"
+                        welcome_msg += f"You will receive notifications about:\n"
+                        welcome_msg += f"• New orders placed\n"
+                        welcome_msg += f"• Orders filled\n"
+                        welcome_msg += f"• Take profit achieved\n"
+                        welcome_msg += f"• Risk alerts\n\n"
+                        welcome_msg += f"<b>Commands:</b>\n"
+                        welcome_msg += f"• /start - Resume bot (if stopped)\n"
+                        welcome_msg += f"• /stop - Stop bot after next TP\n"
+                        welcome_msg += f"• /setamount X.XX - Set trade amount for next run\n"
+                        
+                        bot.send_message(welcome_msg, chat_id=chat_id, disable_notification=False)
+                        
+                        if logger:
+                            logger.info(f"Sent welcome message to chat_id: {chat_id}")
+                
+                # Handle /stop command
+                elif text == '/stop':
+                    if not gStopRequested:
+                        gStopRequested = True
+                        stop_msg = f"⏸️ <b>Stop Requested</b>\n\n"
+                        stop_msg += f"The bot will:\n"
+                        stop_msg += f"1. Continue running until next target profit\n"
+                        stop_msg += f"2. Close all positions when TP is reached\n"
+                        stop_msg += f"3. Pause and wait for /start command\n\n"
+                        stop_msg += f"Current status: Waiting for TP... 💤"
+                        
+                        bot.send_message(stop_msg, chat_id=chat_id, disable_notification=False)
+                        
+                        if logger:
+                            logger.info(f"Stop requested by user from chat_id: {chat_id}")
+                    else:
+                        already_stopped_msg = f"⏸️ Stop already requested. Bot will pause after next TP."
+                        bot.send_message(already_stopped_msg, chat_id=chat_id, disable_notification=False)
+                
+                # Handle /setamount command
+                elif text.startswith('/setamount'):
+                    try:
+                        parts = text.split()
+                        if len(parts) == 2:
+                            new_amount = float(parts[1])
+                            if new_amount > 0:
+                                gNextTradeAmount = new_amount
+                                amount_msg = f"💰 <b>Trade Amount Updated</b>\n\n"
+                                amount_msg += f"• Configured amount: {TRADE_AMOUNT}\n"
+                                amount_msg += f"• Override amount (persistent): {gNextTradeAmount}\n\n"
+                                amount_msg += (
+                                    "The override will be applied after the next target profit is reached "
+                                    "and will persist for all subsequent runs until you change it again."
+                                )
+                                
+                                bot.send_message(amount_msg, chat_id=chat_id, disable_notification=False)
+                                
+                                if logger:
+                                    logger.info(f"Trade amount set to {gNextTradeAmount} for next run")
+                            else:
+                                error_msg = f"❌ Invalid amount. Please provide a positive number.\nExample: /setamount 0.05"
+                                bot.send_message(error_msg, chat_id=chat_id, disable_notification=False)
+                        else:
+                            error_msg = f"❌ Invalid format.\nUsage: /setamount X.XX\nExample: /setamount 0.05"
+                            bot.send_message(error_msg, chat_id=chat_id, disable_notification=False)
+                    except ValueError:
+                        error_msg = f"❌ Invalid number format.\nUsage: /setamount X.XX\nExample: /setamount 0.05"
+                        bot.send_message(error_msg, chat_id=chat_id, disable_notification=False)
+                    except Exception as e:
+                        error_msg = f"❌ Error setting trade amount: {str(e)}"
+                        bot.send_message(error_msg, chat_id=chat_id, disable_notification=False)
+                        if logger:
+                            logger.error(f"Error in /setamount command: {e}")
+                
+                # Handle /status command
+                elif text == '/status':
+                    try:
+                        # Account info
+                        acc_info = mt5_api.account_info() if mt5_api else None
+                        login = getattr(acc_info, 'login', 'N/A') if acc_info else 'N/A'
+                        balance = getattr(acc_info, 'balance', 0.0) if acc_info else 0.0
+                        equity = getattr(acc_info, 'equity', 0.0) if acc_info else 0.0
+                        free_margin = getattr(acc_info, 'margin_free', 0.0) if acc_info else 0.0
+
+                        # Positions and orders (strategy-only via magic)
+                        open_positions = mt5_api.positions_get(symbol=TRADE_SYMBOL) if mt5_api else []
+                        pos_count = 0
+                        open_pnl = 0.0
+                        for p in open_positions or []:
+                            if getattr(p, 'magic', None) == 234002:
+                                pos_count += 1
+                                open_pnl += float(getattr(p, 'profit', 0.0))
+
+                        pending_orders = mt5_api.orders_get(symbol=TRADE_SYMBOL) if mt5_api else []
+                        order_count = 0
+                        for o in pending_orders or []:
+                            if getattr(o, 'magic', None) == 234002:
+                                order_count += 1
+
+                        status_str = 'Paused ⏸️' if gBotPaused else ('Stopping after TP ⏳' if gStopRequested else 'Running ✅')
+                        next_amount_str = f"{gNextTradeAmount}" if 'gNextTradeAmount' in globals() and gNextTradeAmount else '-'
+                        # Run time
+                        run_time_str = '-'
+                        try:
+                            if gSessionStartTime:
+                                run_time = datetime.now() - gSessionStartTime
+                                run_time_str = str(run_time).split('.')[0]
+                        except Exception:
+                            pass
+
+                        msg = f"🤖 <b>Bot Status</b>\n\n"
+                        msg += f"• Account: {login}\n"
+                        msg += f"• Symbol: {TRADE_SYMBOL}\n"
+                        msg += f"• Status: {status_str}\n"
+                        # Scheduled stop info
+                        try:
+                            if 'gStopAtDateTime' in globals() and gStopAtDateTime:
+                                msg += f"• Stop at: {gStopAtDateTime.strftime('%Y-%m-%d %H:%M')} GMT+7\n"
+                        except Exception:
+                            pass
+                        msg += f"• Current Index: {gCurrentIdx}\n"
+                        msg += f"• Target Profit Threshold: ${gTpExpected:.2f}\n\n"
+                        msg += f"<b>Session</b>\n"
+                        msg += f"• Run time: {run_time_str}\n\n"
+                        msg += f"<b>Account</b>\n"
+                        msg += f"• Balance: ${balance:.2f}\n"
+                        msg += f"• Equity: ${equity:.2f}\n"
+                        msg += f"• Free Margin: ${free_margin:.2f}\n\n"
+                        msg += f"<b>Positions & Orders</b>\n"
+                        msg += f"• Open positions: {pos_count}\n"
+                        msg += f"• Pending orders: {order_count}\n"
+                        msg += f"• Open PnL (strategy): ${open_pnl:.2f}\n\n"
+                        msg += f"<b>Trade Amount</b>\n"
+                        msg += f"• Configured amount: {TRADE_AMOUNT}\n"
+                        msg += f"• Next run override: {next_amount_str}\n\n"
+                        msg += f"<b>Guards</b>\n"
+                        try:
+                            qh_state = 'on' if gQuietHoursEnabled else 'off'
+                            msg += f"• Quiet hours: {qh_state} ({gQuietHoursStart:02d}-{gQuietHoursEnd:02d} x{gQuietHoursFactor})\n"
+                            bl_state = 'on' if gBlackoutEnabled else 'off'
+                            msg += f"• Blackout: {bl_state} ({gBlackoutStart:02d}-{gBlackoutEnd:02d})\n"
+                            msg += f"• Caps: maxDD={gMaxDDThreshold}, maxPos={gMaxPositions}, maxOrders={gMaxOrders}, maxSpread={gMaxSpread}\n"
+                        except Exception:
+                            pass
+
+                        bot.send_message(msg, chat_id=chat_id, disable_notification=False)
+                    except Exception as e:
+                        if logger:
+                            logger.error(f"Error building /status: {e}")
+                        bot.send_message("❌ Failed to get status.", chat_id=chat_id, disable_notification=False)
+
+                # Handle /help command
+                elif text == '/help':
+                    try:
+                        help_msg = (
+                            "📖 <b>Available Commands</b>\n\n"
+                            "<b>Control</b>\n"
+                            "• /start — Resume bot (if paused)\n"
+                            "• /resume — Alias of /start\n"
+                            "• /pause — Pause immediately (no new grids)\n"
+                            "• /stop — Finish current cycle, pause after TP\n"
+                            "• /stopat HH:MM — Schedule pause at time (GMT+7)\n"
+                            "• /panic — Emergency stop (requires '/panic confirm')\n\n"
+                            "<b>Configuration</b>\n"
+                            "• /setamount X.XX — Set persistent override (applies after next TP)\n"
+                            "• /clearamount — Remove persistent override\n"
+                            "• /quiethours — Show or set quiet-hours window and factor\n\n"
+                            "• /setmaxdd X — Auto-pause if drawdown exceeds X\n"
+                            "• /setmaxpos N — Cap concurrent positions\n"
+                            "• /setmaxorders N — Cap concurrent pending orders\n"
+                            "• /setspread X — Max allowed spread\n"
+                            "• /blackout — Show or set a full trade blackout window\n\n"
+                            "<b>Insights</b>\n"
+                            "• /status — Bot and account status\n"
+                            "• /drawdown — Show drawdown report\n\n"
+                            "• /history N — Last N deals\n"
+                            "• /pnl today|week|month — Aggregated PnL\n"
+                            "• /filled — Show filled orders summary\n"
+                            "• /pattern — Show consecutive filled-order pattern\n\n"
+                            "<b>Examples</b>\n"
+                            "• /setamount 0.05\n"
+                            "• /stopat 21:00\n"
+                            "• /setmaxdd 300\n"
+                            "• /setspread 0.30\n"
+                            "• /panic confirm\n"
+                        )
+                        bot.send_message(help_msg, chat_id=chat_id, disable_notification=False)
+                    except Exception as e:
+                        if logger:
+                            logger.error(f"Error building /help: {e}")
+                        bot.send_message("❌ Failed to build help.", chat_id=chat_id, disable_notification=False)
+
+                # Handle /pause command
+                elif text == '/pause':
+                    try:
+                        if not gBotPaused:
+                            gBotPaused = True
+                            gStopRequested = False
+                            bot.send_message(
+                                "⏸️ <b>Bot Paused</b>\n\nTrading is paused immediately. No new grids will be placed. Send /start or /resume to continue.",
+                                chat_id=chat_id,
+                                disable_notification=False,
+                            )
+                            if logger:
+                                logger.info("Bot paused by user command")
+                        else:
+                            bot.send_message("⏸️ Bot is already paused.", chat_id=chat_id, disable_notification=False)
+                    except Exception as e:
+                        if logger:
+                            logger.error(f"Error handling /pause: {e}")
+
+                # Handle /panic command (requires confirmation)
+                elif text.startswith('/panic'):
+                    try:
+                        if text.strip().lower() == '/panic confirm':
+                            # Close and cancel immediately for strategy-owned items, then pause
+                            if mt5_api:
+                                try:
+                                    close_all_positions(mt5_api, TRADE_SYMBOL, logger)
+                                except Exception as e:
+                                    if logger:
+                                        logger.error(f"/panic close_all_positions error: {e}")
+                                try:
+                                    cancel_all_pending_orders(mt5_api, TRADE_SYMBOL, logger)
+                                except Exception as e:
+                                    if logger:
+                                        logger.error(f"/panic cancel_all_pending_orders error: {e}")
+                            gBotPaused = True
+                            gStopRequested = False
+                            # Optional: clear in-memory state
+                            try:
+                                gDetailOrders.clear()
+                            except Exception:
+                                pass
+                            try:
+                                gNotifiedFilled.clear()
+                            except Exception:
+                                pass
+                            bot.send_message(
+                                "🛑 <b>PANIC STOP executed</b>\n\nAll strategy positions closed, pending orders cancelled, and bot paused. Send /start or /resume to continue.",
+                                chat_id=chat_id,
+                                disable_notification=False,
+                            )
+                            if logger:
+                                logger.warning("PANIC STOP executed: closed positions, cancelled orders, paused bot")
+                        else:
+                            bot.send_message(
+                                "⚠️ This will close all strategy positions and cancel all strategy orders immediately.\n\n"
+                                "If you are sure, send:\n<b>/panic confirm</b>",
+                                chat_id=chat_id,
+                                disable_notification=False,
+                            )
+                    except Exception as e:
+                        if logger:
+                            logger.error(f"Error handling /panic: {e}")
+
+                # Handle /resume command (alias of /start)
+                elif text == '/resume':
+                    try:
+                        # Get account number
+                        account_number = "N/A"
+                        if mt5_api:
+                            try:
+                                acc_info = mt5_api.account_info()
+                                if acc_info and hasattr(acc_info, 'login'):
+                                    account_number = acc_info.login
+                            except Exception as e:
+                                if logger:
+                                    logger.debug(f"Could not get account info: {e}")
+                        if gBotPaused:
+                            gBotPaused = False
+                            gStopRequested = False
+                            resume_msg = (
+                                "▶️ <b>Bot Resumed!</b>\n\n"
+                                f"• Account: {account_number}\n"
+                                f"• Symbol: {TRADE_SYMBOL}\n"
+                                f"• Trade Amount: {TRADE_AMOUNT}\n"
+                                "• Status: Running ✅\n\n"
+                                "The bot will now resume trading operations."
+                            )
+                            bot.send_message(resume_msg, chat_id=chat_id, disable_notification=False)
+                            if logger:
+                                logger.info("Bot resumed by /resume")
+                        else:
+                            bot.send_message("▶️ Bot is already running.", chat_id=chat_id, disable_notification=False)
+                    except Exception as e:
+                        if logger:
+                            logger.error(f"Error handling /resume: {e}")
+
+                # Handle /drawdown command
+                elif text == '/drawdown':
+                    try:
+                        bot.send_message(drawdown_report(), chat_id=chat_id, disable_notification=False)
+                    except Exception as e:
+                        if logger:
+                            logger.error(f"Error handling /drawdown: {e}")
+
+                # Handle /stopat HH:MM (GMT+7) or /stopat off
+                elif text.startswith('/stopat'):
+                    try:
+                        parts = text.split()
+                        if len(parts) == 2 and parts[1].lower() == 'off':
+                            gStopAtDateTime = None
+                            bot.send_message("🕒 Scheduled pause cleared.", chat_id=chat_id, disable_notification=False)
+                        elif len(parts) == 2 and ':' in parts[1]:
+                            hh, mm = parts[1].split(':', 1)
+                            hh_i, mm_i = int(hh), int(mm)
+                            if not (0 <= hh_i <= 23 and 0 <= mm_i <= 59):
+                                raise ValueError('Invalid time')
+                            tz = timezone(timedelta(hours=7))
+                            now7 = datetime.now(tz)
+                            sched = now7.replace(hour=hh_i, minute=mm_i, second=0, microsecond=0)
+                            if sched <= now7:
+                                sched += timedelta(days=1)
+                            gStopAtDateTime = sched
+                            bot.send_message(
+                                f"🕒 Will pause at {sched.strftime('%Y-%m-%d %H:%M')} GMT+7.",
+                                chat_id=chat_id,
+                                disable_notification=False,
+                            )
+                        else:
+                            bot.send_message("Usage: /stopat HH:MM or /stopat off", chat_id=chat_id, disable_notification=False)
+                    except Exception as e:
+                        if logger:
+                            logger.error(f"Error handling /stopat: {e}")
+                        bot.send_message("❌ Failed to schedule pause.", chat_id=chat_id, disable_notification=False)
+
+                # Handle risk caps and thresholds
+                elif text.startswith('/setmaxdd'):
+                    try:
+                        parts = text.split()
+                        if len(parts) == 2:
+                            gMaxDDThreshold = float(parts[1])
+                            bot.send_message(f"🛡️ Max drawdown set to {gMaxDDThreshold}", chat_id=chat_id, disable_notification=False)
+                        else:
+                            bot.send_message("Usage: /setmaxdd X", chat_id=chat_id, disable_notification=False)
+                    except Exception as e:
+                        if logger:
+                            logger.error(f"Error handling /setmaxdd: {e}")
+                        bot.send_message("❌ Failed to set max drawdown.", chat_id=chat_id, disable_notification=False)
+
+                elif text.startswith('/setmaxpos'):
+                    try:
+                        parts = text.split()
+                        if len(parts) == 2:
+                            gMaxPositions = int(parts[1])
+                            bot.send_message(f"🛡️ Max positions set to {gMaxPositions}", chat_id=chat_id, disable_notification=False)
+                        else:
+                            bot.send_message("Usage: /setmaxpos N", chat_id=chat_id, disable_notification=False)
+                    except Exception as e:
+                        if logger:
+                            logger.error(f"Error handling /setmaxpos: {e}")
+                        bot.send_message("❌ Failed to set max positions.", chat_id=chat_id, disable_notification=False)
+
+                elif text.startswith('/setmaxorders'):
+                    try:
+                        parts = text.split()
+                        if len(parts) == 2:
+                            gMaxOrders = int(parts[1])
+                            bot.send_message(f"🛡️ Max pending orders set to {gMaxOrders}", chat_id=chat_id, disable_notification=False)
+                        else:
+                            bot.send_message("Usage: /setmaxorders N", chat_id=chat_id, disable_notification=False)
+                    except Exception as e:
+                        if logger:
+                            logger.error(f"Error handling /setmaxorders: {e}")
+                        bot.send_message("❌ Failed to set max pending orders.", chat_id=chat_id, disable_notification=False)
+
+                elif text.startswith('/setspread'):
+                    try:
+                        parts = text.split()
+                        if len(parts) == 2:
+                            gMaxSpread = float(parts[1])
+                            bot.send_message(f"🛡️ Max spread set to {gMaxSpread}", chat_id=chat_id, disable_notification=False)
+                        else:
+                            bot.send_message("Usage: /setspread X", chat_id=chat_id, disable_notification=False)
+                    except Exception as e:
+                        if logger:
+                            logger.error(f"Error handling /setspread: {e}")
+                        bot.send_message("❌ Failed to set max spread.", chat_id=chat_id, disable_notification=False)
+
+                # Blackout window command
+                elif text.startswith('/blackout'):
+                    try:
+                        parts = text.split()
+                        if len(parts) == 1:
+                            state = 'on' if gBlackoutEnabled else 'off'
+                            bot.send_message(
+                                f"⛔️ Blackout {state}. Window: {gBlackoutStart:02d}-{gBlackoutEnd:02d} GMT+7",
+                                chat_id=chat_id,
+                                disable_notification=False,
+                            )
+                        elif len(parts) == 2 and parts[1].lower() == 'off':
+                            gBlackoutEnabled = False
+                            bot.send_message("⛔️ Blackout disabled.", chat_id=chat_id, disable_notification=False)
+                        elif len(parts) == 2 and '-' in parts[1]:
+                            start_s, end_s = parts[1].split('-', 1)
+                            start, end = int(start_s), int(end_s)
+                            if not (0 <= start <= 23 and 0 <= end <= 23):
+                                raise ValueError('Hours must be 0-23')
+                            gBlackoutStart, gBlackoutEnd = start, end
+                            gBlackoutEnabled = True
+                            bot.send_message(
+                                f"⛔️ Blackout set: {start:02d}-{end:02d} GMT+7 (enabled)",
+                                chat_id=chat_id,
+                                disable_notification=False,
+                            )
+                        else:
+                            bot.send_message("Usage: /blackout HH-HH or /blackout off", chat_id=chat_id, disable_notification=False)
+                    except Exception as e:
+                        if logger:
+                            logger.error(f"Error handling /blackout: {e}")
+                        bot.send_message("❌ Failed to set blackout.", chat_id=chat_id, disable_notification=False)
+
+                # History: /history N (last N deals)
+                elif text.startswith('/history'):
+                    try:
+                        parts = text.split()
+                        n = int(parts[1]) if len(parts) == 2 else 10
+                        tz = timezone(timedelta(hours=7))
+                        now = datetime.now(tz)
+                        start = now - timedelta(days=30)
+                        deals = mt5_api.history_deals_get(start, now) if mt5_api else []
+                        items = []
+                        for d in deals or []:
+                            try:
+                                if getattr(d, 'symbol', '') != TRADE_SYMBOL:
+                                    continue
+                                if getattr(d, 'magic', None) != 234002:
+                                    continue
+                                t = getattr(d, 'time', None)
+                                ts = datetime.fromtimestamp(t, tz).strftime('%Y-%m-%d %H:%M') if isinstance(t, (int, float)) else str(t)
+                                price = getattr(d, 'price', 0.0)
+                                profit = getattr(d, 'profit', 0.0)
+                                volume = getattr(d, 'volume', 0.0)
+                                dtype = getattr(d, 'type', None)
+                                side = 'BUY' if dtype == mt5_api.DEAL_TYPE_BUY else ('SELL' if dtype == mt5_api.DEAL_TYPE_SELL else str(dtype))
+                                items.append((getattr(d, 'ticket', 0), ts, side, volume, price, profit))
+                            except Exception:
+                                continue
+                        items = list(reversed(sorted(items, key=lambda x: x[0])))  # crude sort by ticket
+                        items = items[:n]
+                        if not items:
+                            bot.send_message("ℹ️ No recent strategy deals found.", chat_id=chat_id, disable_notification=False)
+                        else:
+                            lines = [
+                                f"#{tid} {ts} {side} {vol} @ {price:.2f} → PnL {pnl:+.2f}"
+                                for (tid, ts, side, vol, price, pnl) in items
+                            ]
+                            bot.send_message("\n".join(lines), chat_id=chat_id, disable_notification=False)
+                    except Exception as e:
+                        if logger:
+                            logger.error(f"Error handling /history: {e}")
+                        bot.send_message("❌ Failed to fetch history.", chat_id=chat_id, disable_notification=False)
+
+                # PnL aggregation: /pnl today|week|month
+                elif text.startswith('/pnl'):
+                    try:
+                        parts = text.split()
+                        scope = parts[1].lower() if len(parts) == 2 else 'today'
+                        tz = timezone(timedelta(hours=7))
+                        now = datetime.now(tz)
+                        if scope == 'today':
+                            start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                        elif scope == 'week':
+                            start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+                        elif scope == 'month':
+                            start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+                        else:
+                            bot.send_message("Usage: /pnl today|week|month", chat_id=chat_id, disable_notification=False)
+                            start = None
+                        if start is not None:
+                            deals = mt5_api.history_deals_get(start, now) if mt5_api else []
+                            total = 0.0
+                            count = 0
+                            for d in deals or []:
+                                if getattr(d, 'symbol', '') != TRADE_SYMBOL:
+                                    continue
+                                if getattr(d, 'magic', None) != 234002:
+                                    continue
+                                total += float(getattr(d, 'profit', 0.0))
+                                count += 1
+                            bot.send_message(f"📈 PnL {scope}: {total:+.2f} ({count} deals)", chat_id=chat_id, disable_notification=False)
+                    except Exception as e:
+                        if logger:
+                            logger.error(f"Error handling /pnl: {e}")
+                        bot.send_message("❌ Failed to compute PnL.", chat_id=chat_id, disable_notification=False)
+
+                # Show filled orders summary
+                elif text.strip().lower() == '/filled':
+                    try:
+                        bot.send_message(get_filled_orders_summary(logger), chat_id=chat_id, disable_notification=False)
+                    except Exception as e:
+                        if logger:
+                            logger.error(f"Error handling /filled: {e}")
+                        bot.send_message("❌ Failed to show filled orders.", chat_id=chat_id, disable_notification=False)
+
+                # Show consecutive pattern detection
+                elif text.strip().lower() == '/pattern':
+                    try:
+                        pd = check_consecutive_orders_pattern(logger)
+                        msg = (
+                            "🧩 <b>Consecutive Pattern</b>\n"
+                            f"Detected: {'Yes' if pd.get('pattern_detected') else 'No'}\n"
+                            f"Consecutive BUY pairs: {len(pd.get('consecutive_buys', []))}\n"
+                            f"Consecutive SELL pairs: {len(pd.get('consecutive_sells', []))}\n"
+                            f"Total filled: {pd.get('total_filled', 0)}\n"
+                        )
+                        bot.send_message(msg, chat_id=chat_id, disable_notification=False)
+                    except Exception as e:
+                        if logger:
+                            logger.error(f"Error handling /pattern: {e}")
+                        bot.send_message("❌ Failed to compute pattern.", chat_id=chat_id, disable_notification=False)
+
+                # Handle /clearamount command
+                elif text.strip().lower() == '/clearamount':
+                    try:
+                        if 'gNextTradeAmount' in globals() and gNextTradeAmount is not None:
+                            cleared = gNextTradeAmount
+                            gNextTradeAmount = None
+                            bot.send_message(
+                                f"🧹 Cleared persistent amount override (was: {cleared}).\n"
+                                f"Bot will use configured/time-based amount going forward.",
+                                chat_id=chat_id,
+                                disable_notification=False,
+                            )
+                            if logger:
+                                logger.info("Persistent trade amount override cleared")
+                        else:
+                            bot.send_message("ℹ️ No persistent override set.", chat_id=chat_id, disable_notification=False)
+                    except Exception as e:
+                        if logger:
+                            logger.error(f"Error handling /clearamount: {e}")
+                        bot.send_message("❌ Failed to clear override.", chat_id=chat_id, disable_notification=False)
+
+                # Handle /quiethours command
+                elif text.startswith('/quiethours'):
+                    try:
+                        parts = text.split()
+                        if len(parts) == 1:
+                            state = 'on' if gQuietHoursEnabled else 'off'
+                            bot.send_message(
+                                (
+                                    f"🕰️ <b>Quiet Hours</b> {state}\n"
+                                    f"Window: {gQuietHoursStart:02d}-{gQuietHoursEnd:02d} GMT+7\n"
+                                    f"Factor: x{gQuietHoursFactor}\n\n"
+                                    "Usage:\n"
+                                    "/quiethours on|off\n"
+                                    "/quiethours HH-HH [factor]\n"
+                                    "Example: /quiethours 19-23 0.5"
+                                ),
+                                chat_id=chat_id,
+                                disable_notification=False,
+                            )
+                        elif len(parts) == 2 and parts[1].lower() in ('on','off'):
+                            gQuietHoursEnabled = parts[1].lower() == 'on'
+                            bot.send_message(
+                                f"🕰️ Quiet hours {'enabled' if gQuietHoursEnabled else 'disabled'}.",
+                                chat_id=chat_id,
+                                disable_notification=False,
+                            )
+                        else:
+                            # Expect HH-HH [factor]
+                            rng = parts[1]
+                            if '-' not in rng:
+                                raise ValueError('Range must be HH-HH')
+                            start_s, end_s = rng.split('-', 1)
+                            start = int(start_s)
+                            end = int(end_s)
+                            if not (0 <= start <= 23 and 0 <= end <= 23):
+                                raise ValueError('Hours must be 0-23')
+                            factor = gQuietHoursFactor
+                            if len(parts) >= 3:
+                                factor = float(parts[2])
+                                if factor <= 0:
+                                    raise ValueError('Factor must be > 0')
+                            gQuietHoursStart = start
+                            gQuietHoursEnd = end
+                            gQuietHoursFactor = factor
+                            gQuietHoursEnabled = True
+                            bot.send_message(
+                                f"🕰️ Quiet hours set: {start:02d}-{end:02d} (GMT+7), factor x{factor}. Enabled.",
+                                chat_id=chat_id,
+                                disable_notification=False,
+                            )
+                    except Exception as e:
+                        if logger:
+                            logger.error(f"Error handling /quiethours: {e}")
+                        bot.send_message("❌ Failed to update quiet hours.", chat_id=chat_id, disable_notification=False)
+                
+                # Clear the update so we don't process it again
+                bot.bot.get_updates(offset=update.update_id + 1, timeout=0)
+                
+    except Exception as e:
+        if logger:
+            logger.debug(f"Error handling Telegram command: {e}")
+
 
 ###############################################################################################################
 def main():
@@ -537,6 +1349,10 @@ def main():
     global gStartBalance
     global gNotifiedFilled
     global gTpExpected
+    global gBotPaused
+    global gStopRequested
+    global gNextTradeAmount
+    global gSessionStartTime
     
     logging.basicConfig(
         level=logging.INFO,
@@ -545,6 +1361,7 @@ def main():
     logger = logging.getLogger(__name__)
     logger.info("=== New Grid DCA Strategy for XAUUSD ===")
     script_start_time = datetime.now()
+    gSessionStartTime = script_start_time
     try:
         credentials = config.get_mt5_credentials()
         symbol = TRADE_SYMBOL
@@ -578,6 +1395,48 @@ def main():
         try:
             idx = 0
             while True:
+                # Handle Telegram commands
+                if telegramBot:
+                    handle_telegram_command(telegramBot, mt5_api=mt5.mt5, logger=logger)
+                
+                # Enforce scheduled pause (/stopat)
+                try:
+                    if 'gStopAtDateTime' in globals() and gStopAtDateTime is not None:
+                        now7 = datetime.now(timezone(timedelta(hours=7)))
+                        if now7 >= gStopAtDateTime:
+                            gBotPaused = True
+                            gStopAtDateTime = None
+                            msg = "🕒 Scheduled time reached. Bot paused."
+                            logger.info(msg)
+                            telegramBot.send_message(msg, chat_id=TELEGRAM_CHAT_ID)
+                except Exception as e:
+                    logger.debug(f"Scheduled pause check error: {e}")
+
+                # Enforce max drawdown auto-pause if configured
+                try:
+                    if 'gMaxDDThreshold' in globals() and gMaxDDThreshold is not None and gStartBalance:
+                        eq = get_current_equity(mt5.mt5, logger=logger)
+                        dd = max(0.0, gStartBalance - eq)
+                        if dd >= float(gMaxDDThreshold):
+                            if not gBotPaused:
+                                gBotPaused = True
+                                warn = (
+                                    f"🛑 Max drawdown reached: {dd:.2f} ≥ {gMaxDDThreshold:.2f}. Bot paused.\n"
+                                    f"{drawdown_report()}"
+                                )
+                                logger.warning(warn)
+                                telegramBot.send_message(warn, chat_id=TELEGRAM_CHAT_ID, disable_notification=False)
+                except Exception as e:
+                    logger.debug(f"Drawdown threshold check error: {e}")
+                
+                # Check if bot is paused
+                if gBotPaused:
+                    if idx % 1000 == 0:  # Log every 1000 iterations
+                        logger.info("Bot is paused. Waiting for /start command...")
+                    time.sleep(1)
+                    idx += 1
+                    continue
+                
                 # update list open order IDs
                 saved_orders = []
                 for key, val in gDetailOrders.items():
@@ -714,19 +1573,57 @@ def main():
                     logger.info(msg)
                     telegramBot.send_message(msg, chat_id=TELEGRAM_CHAT_ID, pin_msg=True, disable_notification=False)
 
-                    # Update trade amount based on time (GMT+7 timezone)
-                    gmt_plus_7 = timezone(timedelta(hours=7))
-                    current_time_gmt7 = datetime.now(gmt_plus_7)
-                    current_hour = current_time_gmt7.hour
+                    # Check if stop was requested
+                    if gStopRequested:
+                        gBotPaused = True
+                        gStopRequested = False
+                        pause_msg = f"⏸️ <b>Bot Paused</b>\n\n"
+                        pause_msg += f"Target profit reached and bot is now paused.\n\n"
+                        pause_msg += f"• All positions closed\n"
+                        pause_msg += f"• All orders cancelled\n"
+                        pause_msg += f"• Waiting for /start command to resume\n\n"
+                        pause_msg += f"Send /start to resume trading."
+                        
+                        telegramBot.send_message(pause_msg, chat_id=TELEGRAM_CHAT_ID, pin_msg=True, disable_notification=False)
+                        logger.info("Bot paused after reaching target profit (stop requested)")
+                        continue
+
+                    # Apply new trade amount if set via /setamount command
+                    if gNextTradeAmount is not None:
+                        old_amount = TRADE_AMOUNT
+                        trade_amount = gNextTradeAmount
+                        gTpExpected = trade_amount * 1000
+                        change_msg = f"💰 <b>Trade Amount Changed</b>\n\n"
+                        change_msg += f"• Previous amount: {old_amount}\n"
+                        change_msg += f"• New amount (override): {trade_amount}\n"
+                        change_msg += f"• New TP expected: ${gTpExpected:.2f}\n\n"
+                        change_msg += (
+                            "The override is now active and will remain in effect for future runs until changed."
+                        )
                     
-                    if 19 <= current_hour <= 23:  # 7 PM to 11 PM GMT+7
-                        trade_amount = round(TRADE_AMOUNT / 2, 2)
-                        gTpExpected = trade_amount * 1000 # Adjusted TP expected based on trade amount
-                        logger.info(f"🕰️ Time-based adjustment: Reduced trade amount to {trade_amount} (GMT+7: {current_hour}:00)")
-                        telegramBot.send_message(f"🕰️ Time-based adjustment: Reduced trade amount to {trade_amount} during high-risk hours ({current_hour}:00 GMT+7)", chat_id=TELEGRAM_CHAT_ID)
+                        telegramBot.send_message(change_msg, chat_id=TELEGRAM_CHAT_ID, disable_notification=False)
+                        logger.info(f"Trade amount changed from {old_amount} to {trade_amount}")
                     else:
-                        trade_amount = TRADE_AMOUNT
-                        logger.info(f"🕰️ Normal trade amount: {trade_amount} (GMT+7: {current_hour}:00)")
+                        # Update trade amount based on time (GMT+7 timezone)
+                        gmt_plus_7 = timezone(timedelta(hours=7))
+                        current_time_gmt7 = datetime.now(gmt_plus_7)
+                        current_hour = current_time_gmt7.hour
+                    
+                        in_quiet = (
+                            gQuietHoursEnabled and
+                            (
+                                (gQuietHoursStart <= gQuietHoursEnd and gQuietHoursStart <= current_hour <= gQuietHoursEnd) or
+                                (gQuietHoursStart > gQuietHoursEnd and (current_hour >= gQuietHoursStart or current_hour <= gQuietHoursEnd))
+                            )
+                        )
+                        if in_quiet:
+                            trade_amount = round(TRADE_AMOUNT * gQuietHoursFactor, 2)
+                            gTpExpected = trade_amount * 1000 # Adjusted TP expected based on trade amount
+                            logger.info(f"🕰️ Quiet-hours adjustment: trade amount {trade_amount} (factor x{gQuietHoursFactor}) (GMT+7: {current_hour}:00)")
+                            telegramBot.send_message(f"🕰️ Quiet-hours adjustment: trade amount {trade_amount} (x{gQuietHoursFactor}) during {gQuietHoursStart:02d}-{gQuietHoursEnd:02d} GMT+7", chat_id=TELEGRAM_CHAT_ID)
+                        else:
+                            trade_amount = TRADE_AMOUNT
+                            logger.info(f"🕰️ Normal trade amount: {trade_amount} (GMT+7: {current_hour}:00)")
 
                     # Check if any open positions or open orders remain
                     positions_left = mt5.get_positions()
@@ -740,11 +1637,12 @@ def main():
                         telegramBot.send_message(f"⚠️ Open orders remain after TP: {open_orders_left}", chat_id=TELEGRAM_CHAT_ID)
 
                     script_start_time  = datetime.now()
+                    gSessionStartTime = script_start_time
                     start_balance = get_current_balance(mt5.mt5, logger=logger)
                     gStartBalance = start_balance
                     run_at_index(mt5.mt5, symbol, trade_amount, gCurrentIdx, price=0, logger=logger)
                     
-                time.sleep(0.5)
+                time.sleep(0.2)
         except KeyboardInterrupt:
             logger.info("Interrupted by user. Disconnecting...")
         mt5.disconnect()
