@@ -3,6 +3,12 @@ MetaTrader5>=5.0.45
 pandas>=1.5.0
 numpy>=1.24.0
 python-telegram-bot==13.15
+plotly>=5.10.0
+kaleido>=0.2.1
+
+# Twitter/X API
+tweepy>=4.14.0
+Pillow>=10.0.0
 
 # Development dependencies
 pytest>=7.0.0
