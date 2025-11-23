@@ -1,0 +1,32 @@
+# Telegram Bot Commands for BotFather
+# Copy and paste this list into BotFather when using /setcommands
+
+start - Start trading or resume bot (if paused)
+resume - Alias of start command
+stop - Stop bot after next target profit is reached
+pause - Pause bot immediately (manual pause)
+resume - Resume bot (alias of /start)
+panic - Emergency stop - close all positions (requires confirmation)
+status - Show bot and account status with detailed info
+help - Show all available commands and usage examples
+
+setamount - Set trade amount for next cycle (e.g., /setamount 0.05)
+clearamount - Remove persistent trade amount override
+stopat - Schedule bot pause at specific time (e.g., /stopat 21:00)
+
+setmaxdd - Set maximum drawdown auto-pause threshold
+setmaxpos - Set maximum concurrent positions limit
+setmaxorders - Set maximum pending orders limit
+setspread - Set maximum allowed spread before skipping trades
+setmaxreducebalance - Set maximum equity reduction allowed
+setwithdrawal - Set profit withdrawal threshold for auto-pause
+withdrawalcomplete - Restart strategy after profit withdrawal
+
+blackout - Show or configure trading blackout window
+quiethours - Show or configure quiet hours with reduced trade size
+
+drawdown - Show current drawdown report
+history - Show last N trading deals (e.g., /history 10)
+pnl - Show aggregated profit/loss (today/week/month)
+filled - Show summary of filled orders
+pattern - Show consecutive filled-order pattern analysis

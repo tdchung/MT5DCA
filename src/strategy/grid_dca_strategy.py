@@ -5,6 +5,7 @@ Consolidates common logic used across all main_xxx.py instances.
 
 import logging
 import time
+import os
 from datetime import datetime, timedelta, timezone
 
 
@@ -44,7 +45,8 @@ class GridDCAStrategy:
         self.target_profit = trading_config.get('target_profit', 2.0)
         self.trade_amount = trading_config.get('trade_amount', 0.1)
         self.percent_scale = trading_config.get('percent_scale', 12)
-        self.max_reduce_balance = trading_config.get('max_reduce_balance', 5000)
+        # Dynamic risk management: max_reduce_balance = trade_amount * 10 * 2000
+        self.max_reduce_balance = self.trade_amount * 10 * 2000
         self.min_free_margin = trading_config.get('min_free_margin', 100)
         
         telegram_config = config.config.get('telegram', {})
@@ -59,8 +61,9 @@ class GridDCAStrategy:
         self.notified_filled = set()
         
         # Control flags
-        self.bot_paused = False
+        self.bot_paused = True  # Start paused, require manual /start
         self.stop_requested = False
+        self.user_started = False  # Track if user has started the strategy
         self.next_trade_amount = None
         
         # Quiet hours config
@@ -78,10 +81,18 @@ class GridDCAStrategy:
         self.max_orders = None
         self.max_spread = None
         
+        # Profit withdrawal management
+        self.profit_withdrawal_threshold = None  # Dollar amount to trigger withdrawal pause
+        self.profit_withdrawal_paused = False   # Track if paused for withdrawal
+        self.total_session_profit = 0           # Track accumulated profit across cycles
+        self.withdrawal_start_balance = 0       # Balance when withdrawal process started
+        
         # Blackout window
         self.blackout_enabled = False
         self.blackout_start = 0
         self.blackout_end = 0
+        self.blackout_paused = False  # Track if paused due to blackout
+        self.blackout_pause_notified = False  # Prevent spam notifications
         
         # Scheduled pause
         self.stop_at_datetime = None
@@ -355,25 +366,6 @@ class GridDCAStrategy:
         Places 3 layers of buy stop and 3 layers of sell stop orders.
         """
         try:
-            # Blackout check (GMT+7)
-            gmt_plus_7 = timezone(timedelta(hours=7))
-            now_gmt7 = datetime.now(gmt_plus_7)
-            current_hour = now_gmt7.hour
-            in_blackout = (
-                self.blackout_enabled and (
-                    (self.blackout_start <= self.blackout_end and self.blackout_start <= current_hour <= self.blackout_end) or
-                    (self.blackout_start > self.blackout_end and (current_hour >= self.blackout_start or current_hour <= self.blackout_end))
-                )
-            )
-            if in_blackout:
-                self.logger.info(f"⛔️ Blackout window active {self.blackout_start:02d}-{self.blackout_end:02d} GMT+7. Skipping grid build.")
-                if self.telegram_bot:
-                    self.telegram_bot.send_message(
-                        f"⛔️ Blackout window active {self.blackout_start:02d}-{self.blackout_end:02d} GMT+7. Skipping grid build.",
-                        chat_id=self.telegram_chat_id,
-                    )
-                return
-            
             current_equity = self.get_current_equity()
             current_free_margin = self.get_current_free_margin()
             if current_equity < self.start_balance - self.max_reduce_balance:
@@ -713,10 +705,63 @@ class GridDCAStrategy:
                 except Exception as e:
                     self.logger.debug(f"Drawdown threshold check error: {e}")
                 
+                # Enforce blackout pause/resume
+                try:
+                    gmt_plus_7 = timezone(timedelta(hours=7))
+                    current_time_gmt7 = datetime.now(gmt_plus_7)
+                    current_hour = current_time_gmt7.hour
+                    in_blackout = (
+                        self.blackout_enabled and (
+                            (self.blackout_start <= self.blackout_end and self.blackout_start <= current_hour <= self.blackout_end) or
+                            (self.blackout_start > self.blackout_end and (current_hour >= self.blackout_start or current_hour <= self.blackout_end))
+                        )
+                    )
+                    
+                    # Pause during blackout
+                    if in_blackout and not self.blackout_paused and not self.bot_paused:
+                        self.blackout_paused = True
+                        self.bot_paused = True
+                        self.blackout_pause_notified = False
+                        msg = f"⛔️ Blackout window started ({self.blackout_start:02d}:00-{self.blackout_end:02d}:00 GMT+7). Bot paused automatically."
+                        self.logger.info(msg)
+                        if self.telegram_bot:
+                            self.telegram_bot.send_message(msg, chat_id=self.telegram_chat_id)
+                    
+                    # Auto-resume after blackout
+                    elif not in_blackout and self.blackout_paused:
+                        self.blackout_paused = False
+                        self.bot_paused = False
+                        self.blackout_pause_notified = False
+                        msg = f"⛔️ Blackout window ended. Bot auto-resuming trading operations."
+                        self.logger.info(msg)
+                        if self.telegram_bot:
+                            self.telegram_bot.send_message(msg, chat_id=self.telegram_chat_id)
+                        
+                        # Immediately place grid at current index after resuming
+                        try:
+                            self.run_at_index(symbol, trade_amount, self.current_idx, price=0)
+                        except Exception as e:
+                            self.logger.error(f"Error placing grid after blackout resume: {e}")
+                    
+                except Exception as e:
+                    self.logger.debug(f"Blackout check error: {e}")
+                
                 # Check if bot is paused
                 if self.bot_paused:
                     if idx % 1000 == 0:
-                        self.logger.info("Bot is paused. Waiting for /start command...")
+                        if self.profit_withdrawal_paused:
+                            pause_reason = "profit withdrawal"
+                        elif self.blackout_paused:
+                            pause_reason = "blackout"
+                        elif not self.user_started:
+                            pause_reason = "awaiting start command"
+                            self.logger.info("Strategy is paused. Send /start command to begin trading...")
+                        else:
+                            pause_reason = "manual/scheduled pause"
+                        
+                        if self.user_started or not (not self.user_started):  # Show general message for other pause types
+                            if pause_reason != "awaiting start command":
+                                self.logger.info(f"Bot is paused ({pause_reason}). Waiting...")
                     time.sleep(1)
                     idx += 1
                     continue
@@ -761,8 +806,19 @@ class GridDCAStrategy:
                             self.logger.info(f"Filled order IDs: {self.notified_filled}")
                             
                             all_status_report = self.get_all_order_status_str()
+                            
+                            # Calculate cycle time
+                            cycle_time_str = "-"
+                            try:
+                                if self.session_start_time:
+                                    cycle_time = datetime.now() - self.session_start_time
+                                    cycle_time_str = str(cycle_time).split('.')[0]
+                            except Exception:
+                                pass
+                            
                             msg = f"🔥 <b>Pending order filled - {order_comment}</b>\n"
                             msg += f"ID {oid} | {side} | {order_price:<.2f}\n\n"
+                            msg += f"⏱️ <b>Cycle Time:</b> {cycle_time_str}\n\n"
                             msg += f"{all_status_report}\n{self.drawdown_report()}\n"
                             
                             # Add pattern detection info
@@ -821,12 +877,23 @@ class GridDCAStrategy:
                             self.logger.info(f"❤️ :: {order_comment} :: TP filled: Position ID {oid} closed | P&L: ${pnl:.2f} All Closed P&L: ${closed_pnl:.2f}")
                             self.logger.info(f"TP filled order IDs: {notified_tp}")
                             self.logger.info(f"TP filled: {hit_side} order index {self.current_idx} (ID {oid}) closed. TP price: {hit_tp_price}")
+                            
+                            # Calculate cycle time
+                            cycle_time_str = "-"
+                            try:
+                                if self.session_start_time:
+                                    cycle_time = datetime.now() - self.session_start_time
+                                    cycle_time_str = str(cycle_time).split('.')[0]
+                            except Exception:
+                                pass
+                            
                             msg = f"❤️❤️❤️ <b>TP filled - {order_comment}</b>\n\n"
                             msg += f"<b>Position ID:</b> {oid}\n"
                             msg += f"<b>P&L:</b> ${pnl:.2f}\n"
                             msg += f"<b>All Closed P&L:</b> ${closed_pnl:.2f}\n"
                             msg += f"<b>All P&L:</b> ${closed_pnl + open_pnl:.2f}\n"
-                            msg += f"\n{self.drawdown_report()}\n"
+                            msg += f"⏱️ <b>Cycle Time:</b> {cycle_time_str}\n\n"
+                            msg += f"{self.drawdown_report()}\n"
                             
                             if self.telegram_bot:
                                 self.telegram_bot.send_message(msg, chat_id=self.telegram_chat_id)
@@ -848,15 +915,52 @@ class GridDCAStrategy:
                     
                     current_balance = self.get_current_balance()
                     total_pnl = current_balance - start_balance
+                    cycle_pnl = closed_pnl + open_pnl
+                    self.total_session_profit += cycle_pnl
+                    
                     run_time = datetime.now() - script_start_time
                     run_time_str = str(run_time).split('.')[0]
+                    
+                    # Check profit withdrawal threshold
+                    if (self.profit_withdrawal_threshold is not None and 
+                        self.total_session_profit >= self.profit_withdrawal_threshold and 
+                        not self.profit_withdrawal_paused):
+                        
+                        self.profit_withdrawal_paused = True
+                        self.bot_paused = True
+                        self.withdrawal_start_balance = current_balance
+                        
+                        withdrawal_msg = (
+                            f"💰💰💰 <b>PROFIT WITHDRAWAL THRESHOLD REACHED</b>\n\n"
+                            f"🎯 <b>Threshold:</b> ${self.profit_withdrawal_threshold:.2f}\n"
+                            f"💵 <b>Total Session Profit:</b> ${self.total_session_profit:.2f}\n"
+                            f"📈 <b>Current Cycle P&L:</b> ${cycle_pnl:.2f}\n\n"
+                            f"📊 <b>Account Details:</b>\n"
+                            f"• Start Balance: ${start_balance:.2f}\n"
+                            f"• Current Balance: ${current_balance:.2f}\n"
+                            f"• Total Account P&L: ${total_pnl:.2f}\n\n"
+                            f"⏱️ <b>Session Info:</b>\n"
+                            f"• Total Runtime: {run_time_str}\n"
+                            f"• Profit Rate: ${(self.total_session_profit / (run_time.total_seconds() / 3600)):.2f}/hour\n\n"
+                            f"🔄 <b>Next Steps:</b>\n"
+                            f"1. Move profits to another account\n"
+                            f"2. Send /withdrawalcomplete to restart strategy\n\n"
+                            f"⚠️ <b>Strategy is PAUSED until you confirm withdrawal completion.</b>"
+                        )
+                        
+                        self.logger.warning(f"Profit withdrawal threshold reached: ${self.total_session_profit:.2f} >= ${self.profit_withdrawal_threshold:.2f}")
+                        if self.telegram_bot:
+                            self.telegram_bot.send_message(withdrawal_msg, chat_id=self.telegram_chat_id, pin_msg=True, disable_notification=False)
+                        
+                        continue
                     
                     msg = (
                         f"✅✅✅✅✅ Target profit reached.\n"
                         f"Start balance: {start_balance}\n"
                         f"Current balance: {current_balance}\n"
                         f"Total PnL: {total_pnl}\n"
-                        f"Session PnL: {closed_pnl + open_pnl}\n"
+                        f"Session PnL: {cycle_pnl}\n"
+                        f"Total Session Profit: ${self.total_session_profit:.2f}\n"
                         f"Run time: {run_time_str}"
                     )
                     
@@ -986,13 +1090,29 @@ class GridDCAStrategy:
                         if self.bot_paused:
                             self.bot_paused = False
                             self.stop_requested = False
-                            resume_msg = f"▶️ <b>Bot Resumed!</b>\n\n"
-                            resume_msg += f"• Account: {account_number}\n"
-                            resume_msg += f"• Symbol: {self.trade_symbol}\n"
-                            resume_msg += f"• Trade Amount: {self.trade_amount}\n"
-                            resume_msg += f"• Status: Running ✅\n\n"
-                            resume_msg += f"The bot will now resume trading operations."
-                            self.telegram_bot.send_message(resume_msg, chat_id=chat_id, disable_notification=False)
+                            self.blackout_paused = False  # Reset blackout pause state
+                            
+                            # Check if this is the first start
+                            if not self.user_started:
+                                self.user_started = True
+                                current_equity = self.get_current_equity()
+                                welcome_msg = (
+                                    f"🚀 <b>Grid DCA Strategy Started</b>\n\n"
+                                    f"🟢 <b>Bot Status:</b> Active and ready\n"
+                                    f"💰 <b>Current Equity:</b> ${current_equity:.2f}\n"
+                                    f"⚙️ <b>Magic Number:</b> {self.magic_number}\n\n"
+                                    f"🎯 <b>Initial grid will be placed shortly...</b>\n"
+                                    f"Use /status to monitor progress."
+                                )
+                                self.telegram_bot.send_message(welcome_msg, chat_id=chat_id, disable_notification=False)
+                            else:
+                                resume_msg = f"▶️ <b>Bot Resumed!</b>\n\n"
+                                resume_msg += f"• Account: {account_number}\n"
+                                resume_msg += f"• Symbol: {self.trade_symbol}\n"
+                                resume_msg += f"• Trade Amount: {self.trade_amount}\n"
+                                resume_msg += f"• Status: Running ✅\n\n"
+                                resume_msg += f"The bot will now resume trading operations."
+                                self.telegram_bot.send_message(resume_msg, chat_id=chat_id, disable_notification=False)
                             self.logger.info(f"Bot resumed by user command from chat_id: {chat_id}")
                         else:
                             welcome_msg = f"👋 <b>Hello!</b>\n\n"
@@ -1085,7 +1205,17 @@ class GridDCAStrategy:
                                 if getattr(o, 'magic', None) == self.magic_number:
                                     order_count += 1
 
-                            status_str = 'Paused ⏸️' if self.bot_paused else ('Stopping after TP ⏳' if self.stop_requested else 'Running ✅')
+                            if self.bot_paused:
+                                if self.profit_withdrawal_paused:
+                                    status_str = 'Paused (Profit Withdrawal) 💰⏸️'
+                                elif self.blackout_paused:
+                                    status_str = 'Paused (Blackout) ⛔️⏸️'
+                                elif not self.user_started:
+                                    status_str = 'Paused (Awaiting Start) 🔶⏸️'
+                                else:
+                                    status_str = 'Paused ⏸️'
+                            else:
+                                status_str = 'Stopping after TP ⏳' if self.stop_requested else 'Running ✅'
                             next_amount_str = f"{self.next_trade_amount}" if self.next_trade_amount else '-'
                             
                             run_time_str = '-'
@@ -1108,7 +1238,8 @@ class GridDCAStrategy:
                             msg += f"• Current Index: {self.current_idx}\n"
                             msg += f"• Target Profit Threshold: ${self.tp_expected:.2f}\n\n"
                             msg += f"<b>Session</b>\n"
-                            msg += f"• Run time: {run_time_str}\n\n"
+                            msg += f"• Run time: {run_time_str}\n"
+                            msg += f"• Session profit: ${self.total_session_profit:.2f}\n\n"
                             msg += f"<b>Account</b>\n"
                             msg += f"• Balance: ${balance:.2f}\n"
                             msg += f"• Equity: ${equity:.2f}\n"
@@ -1127,6 +1258,9 @@ class GridDCAStrategy:
                                 bl_state = 'on' if self.blackout_enabled else 'off'
                                 msg += f"• Blackout: {bl_state} ({self.blackout_start:02d}-{self.blackout_end:02d})\n"
                                 msg += f"• Caps: maxDD={self.max_dd_threshold}, maxPos={self.max_positions}, maxOrders={self.max_orders}, maxSpread={self.max_spread}\n"
+                                msg += f"• Max reduce balance: ${self.max_reduce_balance:.2f}\n"
+                                if self.profit_withdrawal_threshold:
+                                    msg += f"• Profit withdrawal: ${self.profit_withdrawal_threshold:.2f}\n"
                             except Exception:
                                 pass
                             
@@ -1152,7 +1286,7 @@ class GridDCAStrategy:
                             help_msg = (
                                 "📖 <b>Available Commands</b>\n\n"
                                 "<b>Control</b>\n"
-                                "• /start — Resume bot (if paused)\n"
+                                "• /start — Start trading or resume bot (if paused)\n"
                                 "• /resume — Alias of /start\n"
                                 "• /pause — Pause immediately (no new grids)\n"
                                 "• /stop — Finish current cycle, pause after TP\n"
@@ -1166,6 +1300,9 @@ class GridDCAStrategy:
                                 "• /setmaxpos N — Cap concurrent positions\n"
                                 "• /setmaxorders N — Cap concurrent pending orders\n"
                                 "• /setspread X — Max allowed spread\n"
+                                "• /setmaxreducebalance X — Max equity reduction allowed\n"
+                                "• /setwithdrawal X — Set profit withdrawal threshold\n"
+                                "• /withdrawalcomplete — Restart after profit withdrawal\n"
                                 "• /blackout — Show or set a full trade blackout window\n\n"
                                 "<b>Insights</b>\n"
                                 "• /status — Bot and account status\n"
@@ -1179,6 +1316,8 @@ class GridDCAStrategy:
                                 "• /stopat 21:00\n"
                                 "• /setmaxdd 300\n"
                                 "• /setspread 0.30\n"
+                                "• /setmaxreducebalance 5000\n"
+                                "• /setwithdrawal 500\n"
                                 "• /panic confirm\n"
                             )
                             self.telegram_bot.send_message(help_msg, chat_id=chat_id, disable_notification=False)
@@ -1192,6 +1331,7 @@ class GridDCAStrategy:
                             if not self.bot_paused:
                                 self.bot_paused = True
                                 self.stop_requested = False
+                                self.blackout_paused = False  # Manual pause overrides blackout
                                 self.telegram_bot.send_message(
                                     "⏸️ <b>Bot Paused</b>\n\nTrading is paused immediately. No new grids will be placed. Send /start or /resume to continue.",
                                     chat_id=chat_id,
@@ -1243,6 +1383,7 @@ class GridDCAStrategy:
                             if self.bot_paused:
                                 self.bot_paused = False
                                 self.stop_requested = False
+                                self.blackout_paused = False  # Reset blackout pause state
                                 resume_msg = (
                                     "▶️ <b>Bot Resumed!</b>\n\n"
                                     f"• Account: {account_number}\n"
@@ -1361,6 +1502,121 @@ class GridDCAStrategy:
                         except Exception as e:
                             self.logger.error(f"Error handling /setspread: {e}")
                             self.telegram_bot.send_message("❌ Failed to set max spread.", chat_id=chat_id, disable_notification=False)
+
+                    # Handle /setwithdrawal command (set profit withdrawal threshold)
+                    elif text.startswith('/setwithdrawal'):
+                        try:
+                            parts = text.split()
+                            if len(parts) == 2:
+                                new_threshold = float(parts[1])
+                                if new_threshold > 0:
+                                    old_threshold = self.profit_withdrawal_threshold
+                                    self.profit_withdrawal_threshold = new_threshold
+                                    success_msg = (
+                                        f"💰 <b>Profit Withdrawal Threshold Set</b>\n\n"
+                                        f"• Previous: ${old_threshold:.2f}" if old_threshold else "• Previous: Not set\n"
+                                        f"• New Threshold: ${new_threshold:.2f}\n\n"
+                                        f"Strategy will pause when total session profit reaches ${new_threshold:.2f}\n"
+                                        f"Current Session Profit: ${self.total_session_profit:.2f}"
+                                    )
+                                    self.telegram_bot.send_message(success_msg, chat_id=chat_id, disable_notification=False)
+                                    self.logger.info(f"Profit withdrawal threshold set to ${new_threshold:.2f}")
+                                else:
+                                    error_msg = "❌ Amount must be greater than 0.\nExample: /setwithdrawal 500"
+                                    self.telegram_bot.send_message(error_msg, chat_id=chat_id, disable_notification=False)
+                            else:
+                                help_msg = (
+                                    "💰 <b>Set Profit Withdrawal Threshold</b>\n\n"
+                                    "Usage: /setwithdrawal AMOUNT\n"
+                                    "Bot will pause when total session profit reaches this amount.\n\n"
+                                    "Examples:\n"
+                                    "• /setwithdrawal 500 (pause at $500 profit)\n"
+                                    "• /setwithdrawal 1000 (pause at $1000 profit)\n\n"
+                                    f"Current threshold: ${self.profit_withdrawal_threshold:.2f}" if self.profit_withdrawal_threshold else "Current threshold: Not set\n"
+                                    f"Current session profit: ${self.total_session_profit:.2f}"
+                                )
+                                self.telegram_bot.send_message(help_msg, chat_id=chat_id, disable_notification=False)
+                        except ValueError:
+                            error_msg = "❌ Invalid number format.\nUsage: /setwithdrawal AMOUNT\nExample: /setwithdrawal 500"
+                            self.telegram_bot.send_message(error_msg, chat_id=chat_id, disable_notification=False)
+                        except Exception as e:
+                            self.logger.error(f"Error in /setwithdrawal command: {e}")
+                    
+                    # Handle /withdrawalcomplete command (restart after profit withdrawal)
+                    elif text == '/withdrawalcomplete':
+                        if self.profit_withdrawal_paused:
+                            # Reset all strategy state for fresh restart
+                            self.profit_withdrawal_paused = False
+                            self.bot_paused = False
+                            self.stop_requested = False
+                            self.blackout_paused = False
+                            
+                            # Reset profit tracking
+                            self.total_session_profit = 0
+                            
+                            # Reset strategy state
+                            self.detail_orders = {}
+                            self.notified_filled.clear()
+                            self.current_idx = 0
+                            self.max_drawdown = 0
+                            
+                            # Get fresh balance and restart
+                            new_start_balance = self.get_current_balance()
+                            balance_difference = new_start_balance - self.withdrawal_start_balance
+                            
+                            restart_msg = (
+                                f"🔄 <b>STRATEGY RESTARTED AFTER WITHDRAWAL</b>\n\n"
+                                f"💰 <b>Balance Update:</b>\n"
+                                f"• Balance before withdrawal: ${self.withdrawal_start_balance:.2f}\n"
+                                f"• Current balance: ${new_start_balance:.2f}\n"
+                                f"• Difference: ${balance_difference:.2f}\n\n"
+                                f"🔄 <b>Fresh Start:</b>\n"
+                                f"• Profit tracking reset to $0\n"
+                                f"• All positions and orders cleared\n"
+                                f"• Grid index reset to 0\n"
+                                f"• Drawdown tracking reset\n\n"
+                                f"✅ <b>Strategy is now running with clean state!</b>"
+                            )
+                            
+                            self.telegram_bot.send_message(restart_msg, chat_id=chat_id, pin_msg=True, disable_notification=False)
+                            self.logger.info(f"Strategy restarted after profit withdrawal. New balance: ${new_start_balance:.2f}")
+                            
+                        else:
+                            error_msg = (
+                                "❌ <b>No withdrawal in progress</b>\n\n"
+                                "This command is only available when the bot is paused for profit withdrawal.\n\n"
+                                f"Current session profit: ${self.total_session_profit:.2f}\n"
+                                f"Withdrawal threshold: ${self.profit_withdrawal_threshold:.2f}" if self.profit_withdrawal_threshold else "Withdrawal threshold: Not set"
+                            )
+                            self.telegram_bot.send_message(error_msg, chat_id=chat_id, disable_notification=False)
+
+                    elif text.startswith('/setmaxreducebalance'):
+                        try:
+                            parts = text.split()
+                            if len(parts) == 2:
+                                new_max_reduce = float(parts[1])
+                                if new_max_reduce > 0:
+                                    self.max_reduce_balance = new_max_reduce
+                                    self.telegram_bot.send_message(f"🛡️ Max reduce balance set to ${self.max_reduce_balance:.2f}", chat_id=chat_id, disable_notification=False)
+                                    self.logger.info(f"Max reduce balance updated to {self.max_reduce_balance}")
+                                else:
+                                    self.telegram_bot.send_message("❌ Max reduce balance must be positive.", chat_id=chat_id, disable_notification=False)
+                            else:
+                                self.telegram_bot.send_message("Usage: /setmaxreducebalance XXXX\nExample: /setmaxreducebalance 5000", chat_id=chat_id, disable_notification=False)
+                        except ValueError:
+                            self.telegram_bot.send_message("❌ Invalid number format.\nUsage: /setmaxreducebalance XXXX\nExample: /setmaxreducebalance 5000", chat_id=chat_id, disable_notification=False)
+                        except Exception as e:
+                            self.logger.error(f"Error handling /setmaxreducebalance: {e}")
+                            self.telegram_bot.send_message("❌ Failed to set max reduce balance.", chat_id=chat_id, disable_notification=False)
+                        
+                        # Check current index for new orders after setting max reduce balance
+                        try:
+                            self.run_at_index(self.trade_symbol, self.trade_amount, self.current_idx, price=0)
+                        except Exception as e:
+                            self.logger.error(f"Error checking index after /setmaxreducebalance: {e}")
+                        
+                        idx += 1
+                        continue
 
                     # Blackout window
                     elif text.startswith('/blackout'):

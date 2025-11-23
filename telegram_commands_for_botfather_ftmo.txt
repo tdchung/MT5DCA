@@ -1,0 +1,27 @@
+start - Resume bot or start trading (FTMO mode)
+resume - Alias of start command
+pause - Pause immediately (no new grids)
+stop - Finish current cycle, pause after TP
+stopat - Schedule pause at specific time (GMT+7)
+panic - Emergency stop (requires confirmation)
+setamount - Set persistent trade amount override
+clearamount - Remove persistent amount override
+quiethours - Set quiet-hours window and factor
+setmaxdd - Auto-pause if drawdown exceeds limit
+setmaxpos - Cap maximum concurrent positions
+setmaxorders - Cap maximum pending orders
+setspread - Set maximum allowed spread
+setmaxreducebalance - Set maximum equity reduction allowed
+tradinghalt - Control 4AM-6:30AM trading halt (news protection)
+setminequity - Set minimum equity threshold (prop firm protection)
+resetequity - Reset equity emergency state
+blackout - Set full trade blackout window
+status - Show bot and account status
+drawdown - Show drawdown report
+history - Show last N deals
+pnl - Show aggregated PnL (today/week/month)
+filled - Show filled orders summary
+pattern - Show consecutive filled-order pattern
+balance - Generate balance/equity chart
+balancelog - Show balance/equity log file info
+help - Show all available commands

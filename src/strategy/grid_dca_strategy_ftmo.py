@@ -2,6 +2,7 @@
 Grid DCA Strategy - Reusable Strategy Module
 Consolidates common logic used across all main_xxx.py instances.
 """
+
 import logging
 import time
 import csv
@@ -12,6 +13,8 @@ from plotly.subplots import make_subplots
 import plotly.io as pio
 import pandas as pd
 import io
+
+
 class GridDCAStrategy:
     """
     Grid DCA Strategy with:
@@ -23,9 +26,11 @@ class GridDCAStrategy:
     - Consecutive order pattern detection
     - Risk management guards (spread, blackout, capacity)
     """
+    
     def __init__(self, config, mt5_connection, telegram_bot=None, logger=None):
         """
         Initialize strategy with configuration and connections.
+        
         Args:
             config: ConfigManager instance with trading and telegram settings
             mt5_connection: MT5Connection instance
@@ -37,6 +42,7 @@ class GridDCAStrategy:
         self.mt5_api = mt5_connection.mt5
         self.telegram_bot = telegram_bot
         self.logger = logger or logging.getLogger(__name__)
+        
         # Load configuration
         trading_config = config.config.get('trading', {})
         self.fibonacci_levels = trading_config.get('fibonacci_levels', [1, 1, 2, 2, 3, 3, 5, 5, 8, 8, 13, 13, 13, 13, 13])
@@ -46,12 +52,11 @@ class GridDCAStrategy:
         self.trade_amount = trading_config.get('trade_amount', 0.1)
         self.percent_scale = trading_config.get('percent_scale', 12)
         self.max_reduce_balance = trading_config.get('max_reduce_balance', 5000)
-        self.max_reduce_enabled = trading_config.get('max_reduce_enabled', True)
-        self.max_reduce_percentage = trading_config.get('max_reduce_percentage', None)  # Optional percentage-based limit
-        self.max_reduce_use_percentage = trading_config.get('max_reduce_use_percentage', False)
         self.min_free_margin = trading_config.get('min_free_margin', 100)
+        
         telegram_config = config.config.get('telegram', {})
         self.telegram_chat_id = telegram_config.get('chat_id')
+        
         # Strategy state
         self.tp_expected = 0
         self.detail_orders = {}
@@ -59,54 +64,67 @@ class GridDCAStrategy:
         self.start_balance = 0
         self.max_drawdown = 0
         self.notified_filled = set()
+        
         # Control flags
-        self.bot_paused = False
+        self.bot_paused = True  # Start paused for FTMO - wait for /start command
         self.stop_requested = False
         self.next_trade_amount = None
+        self.user_started = False  # Track if user has started the bot
+        
         # Quiet hours config
         self.quiet_hours_enabled = True
         self.quiet_hours_start = 19
         self.quiet_hours_end = 23
         self.quiet_hours_factor = 0.5
+        
         # Session tracking
         self.session_start_time = None
+        
         # Risk management
         self.max_dd_threshold = None
         self.max_positions = None
         self.max_orders = None
         self.max_spread = None
-        # Blackout window (2am-6am GMT+7 for risk management)
-        self.blackout_enabled = True
-        self.blackout_start = 2  # 2am GMT+7
-        self.blackout_end = 6    # 6am GMT+7
-        # Weekend blackout (Saturday and Sunday)
-        self.weekend_blackout_enabled = True
+        
+        # Prop firm equity protection
+        self.min_equity_threshold = None  # Minimum equity to maintain (prop firm protection)
+        self.equity_emergency_triggered = False  # Track if emergency stop was triggered
+        self.equity_threshold_required = True  # FTMO requires setting minimum equity before trading
+        
+        # Blackout window
+        self.blackout_enabled = False
+        self.blackout_start = 0
+        self.blackout_end = 0
+        
+        # Trading halt (news/volatility protection)
+        self.trading_halt_enabled = True  # Enabled by default for safety
+        self.trading_halt_start = 4   # 4:00 AM
+        self.trading_halt_end = 6     # 6:30 AM (we'll handle minutes separately)
+        self.trading_halt_end_minutes = 30  # Additional 30 minutes for 6:30
+        self.trading_halt_active = False  # Track if currently in halt period
+        self.trading_halt_notified = False  # Prevent spam notifications
+        
         # Scheduled pause
         self.stop_at_datetime = None
+        
         # Magic number for strategy identification
         self.magic_number = 234002
+        
         # Telegram update tracking (to avoid processing same command multiple times)
         self.last_telegram_update_id = None
+        
         # Balance/equity tracking for periodic logging
         self.last_balance_log_time = None
         self.balance_log_interval = 60  # 1 minute in seconds
         self.balance_log_file = None
-        # Blackout state tracking for notifications
-        self.in_blackout_period = False
-        self.blackout_allow_cycle_completion = True  # Allow current cycle to complete during blackout
-        # Max reduce emergency stop tracking
-        self.max_reduce_triggered = False
-        self.max_reduce_threshold_equity = None
-        self.max_reduce_warning_sent = False  # Track if warning was sent
-        self.max_reduce_warning_threshold = 0.8  # Send warning at 80% of limit
-        self.max_reduce_trigger_time = None  # Track when emergency stop was triggered
-        self.max_reduce_peak_drawdown = 0  # Track peak drawdown before reset
+    
     def check_pending_order_filled(self, history, order_id):
         """Check if a pending order has been filled by looking in history."""
         for record in history:
             if record.position_id == order_id and record.order == order_id:
                 return True
         return False
+    
     def check_position_closed(self, order_id):
         """Check if a position has been closed."""
         try:
@@ -116,6 +134,7 @@ class GridDCAStrategy:
         except Exception as e:
             self.logger.error(f"ERROR :: check_position_closed :: {e}")
         return False
+    
     def pos_closed_pnl(self, position_id):
         """Get PnL from a closed position."""
         pnl = 0
@@ -128,6 +147,7 @@ class GridDCAStrategy:
         except Exception as e:
             self.logger.error(f"ERROR :: pos_closed_pnl :: {e}")
         return pnl
+    
     def get_current_balance(self):
         """Get current account balance."""
         current_balance = 0
@@ -139,6 +159,7 @@ class GridDCAStrategy:
         except Exception as e:
             self.logger.error(f"Error getting balance: {e}")
         return current_balance
+    
     def get_current_equity(self):
         """Get current account equity."""
         current_equity = 0
@@ -150,6 +171,7 @@ class GridDCAStrategy:
         except Exception as e:
             self.logger.error(f"Error getting equity: {e}")
         return current_equity
+    
     def get_current_free_margin(self):
         """Get current free margin."""
         current_free_margin = 0
@@ -161,6 +183,7 @@ class GridDCAStrategy:
         except Exception as e:
             self.logger.error(f"Error getting free margin: {e}")
         return current_free_margin
+    
     def initialize_balance_log(self):
         """Initialize the balance/equity log file."""
         try:
@@ -168,6 +191,7 @@ class GridDCAStrategy:
             balances_dir = os.path.join("data", "balances")
             if not os.path.exists(balances_dir):
                 os.makedirs(balances_dir)
+            
             # Get account info for filename
             account_number = "unknown"
             try:
@@ -176,9 +200,11 @@ class GridDCAStrategy:
                     account_number = str(acc_info.login)
             except Exception:
                 pass
+            
             # Create filename with account number only (no timestamp for continuous logging)
             filename = f"balance_equity_{account_number}.csv"
             self.balance_log_file = os.path.join(balances_dir, filename)
+            
             # Write CSV header only if file doesn't exist
             file_exists = os.path.exists(self.balance_log_file)
             if not file_exists:
@@ -186,6 +212,7 @@ class GridDCAStrategy:
                     writer = csv.writer(f)
                     writer.writerow(['timestamp', 'datetime_gmt7', 'balance', 'equity', 'free_margin', 
                                    'drawdown', 'pnl_from_start', 'session_runtime_minutes'])
+            
             if file_exists:
                 self.logger.info(f"📊 Balance log continuing: {self.balance_log_file}")
             else:
@@ -194,27 +221,33 @@ class GridDCAStrategy:
         except Exception as e:
             self.logger.error(f"Failed to initialize balance log: {e}")
             return False
+    
     def log_balance_equity(self):
         """Log current balance and equity data to CSV file."""
         try:
             if not self.balance_log_file:
                 if not self.initialize_balance_log():
                     return
+            
             # Get current account data
             balance = self.get_current_balance()
             equity = self.get_current_equity()
             free_margin = self.get_current_free_margin()
+            
             # Calculate derived metrics
             drawdown = max(0, self.start_balance - equity) if self.start_balance > 0 else 0
             pnl_from_start = balance - self.start_balance if self.start_balance > 0 else 0
+            
             # Calculate session runtime
             runtime_minutes = 0
             if self.session_start_time:
                 runtime_delta = datetime.now() - self.session_start_time
                 runtime_minutes = runtime_delta.total_seconds() / 60
+            
             # Create timestamp
             now = datetime.now()
             gmt7_time = now + timedelta(hours=7)  # Convert to GMT+7
+            
             # Write data to CSV
             with open(self.balance_log_file, 'a', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
@@ -228,37 +261,48 @@ class GridDCAStrategy:
                     f"{pnl_from_start:.2f}",
                     f"{runtime_minutes:.1f}"
                 ])
+            
             # Update last log time
             self.last_balance_log_time = now
+            
             # Log every 10 minutes for visibility (but save every minute)
             if int(runtime_minutes) % 10 == 0:
                 self.logger.info(f"📊 Balance/Equity logged - Balance: ${balance:.2f}, Equity: ${equity:.2f}, PnL: ${pnl_from_start:.2f}")
+                
         except Exception as e:
             self.logger.error(f"Error logging balance/equity: {e}")
+    
     def should_log_balance(self):
         """Check if it's time to log balance/equity data."""
         if not self.last_balance_log_time:
             return True
+        
         now = datetime.now()
         time_diff = (now - self.last_balance_log_time).total_seconds()
         return time_diff >= self.balance_log_interval
+    
     def generate_balance_chart(self, hours=24):
         """Generate balance/equity chart from CSV data using Plotly."""
         try:
             if not self.balance_log_file or not os.path.exists(self.balance_log_file):
                 return None, "No balance log file found. Start the strategy to begin logging."
+            
             # Read CSV data
             df = pd.read_csv(self.balance_log_file)
             if df.empty:
                 return None, "No data found in balance log file."
+            
             # Convert timestamp to datetime
             df['datetime'] = pd.to_datetime(df['timestamp'])
+            
             # Filter recent data based on hours parameter
             if hours > 0:
                 cutoff_time = datetime.now() - timedelta(hours=hours)
                 df = df[df['datetime'] >= cutoff_time]
+            
             if df.empty:
                 return None, f"No data found in the last {hours} hours."
+            
             # Create subplots with Plotly
             fig = make_subplots(
                 rows=2, cols=1,
@@ -266,6 +310,7 @@ class GridDCAStrategy:
                 vertical_spacing=0.1,
                 shared_xaxes=True
             )
+            
             # Add balance and equity traces to top subplot
             fig.add_trace(
                 go.Scatter(
@@ -278,6 +323,7 @@ class GridDCAStrategy:
                 ),
                 row=1, col=1
             )
+            
             fig.add_trace(
                 go.Scatter(
                     x=df['datetime'], 
@@ -289,6 +335,7 @@ class GridDCAStrategy:
                 ),
                 row=1, col=1
             )
+            
             # Add drawdown and PnL traces to bottom subplot
             fig.add_trace(
                 go.Scatter(
@@ -301,6 +348,7 @@ class GridDCAStrategy:
                 ),
                 row=2, col=1
             )
+            
             fig.add_trace(
                 go.Scatter(
                     x=df['datetime'], 
@@ -312,6 +360,7 @@ class GridDCAStrategy:
                 ),
                 row=2, col=1
             )
+            
             # Update layout with dark theme
             fig.update_layout(
                 title=dict(
@@ -337,6 +386,7 @@ class GridDCAStrategy:
                 margin=dict(l=80, r=40, t=80, b=80),
                 font=dict(color='#ffffff', family='Arial')
             )
+            
             # Update axes with dark theme styling
             fig.update_yaxes(
                 title_text="Amount ($)", 
@@ -365,14 +415,17 @@ class GridDCAStrategy:
                 linecolor='#4a5a6a',
                 row=2, col=1
             )
+            
             # Convert to PNG using kaleido engine
             img_bytes = pio.to_image(fig, format='png', width=1000, height=600, scale=2)
             buf = io.BytesIO(img_bytes)
             buf.seek(0)
+            
             # Generate summary stats
             latest = df.iloc[-1]
             oldest = df.iloc[0]
             duration_hours = (latest['datetime'] - oldest['datetime']).total_seconds() / 3600
+            
             stats = (
                 f"📊 <b>Balance Chart Summary</b>\n\n"
                 f"• Period: {duration_hours:.1f} hours ({len(df)} data points)\n"
@@ -384,10 +437,13 @@ class GridDCAStrategy:
                 f"• Balance Range: ${df['balance'].min():.2f} - ${df['balance'].max():.2f}\n"
                 f"• Equity Range: ${df['equity'].min():.2f} - ${df['equity'].max():.2f}"
             )
+            
             return buf, stats
+            
         except Exception as e:
             self.logger.error(f"Error generating balance chart: {e}")
             return None, f"Error generating chart: {str(e)}"
+    
     def place_pending_order(self, symbol, order_type, price, tp_price, volume=0.01, comment=""):
         """Place a pending order (buy stop or sell stop)."""
         existing_orders = self.mt5_api.orders_get(symbol=symbol)
@@ -395,6 +451,7 @@ class GridDCAStrategy:
             if abs(o.price_open - price) < 1e-4 and o.type == order_type:
                 self.logger.info(f"⏩ Skipping duplicate order at {price:.2f} for {symbol}")
                 return None
+        
         request = {
             "action": self.mt5_api.TRADE_ACTION_PENDING,
             "symbol": symbol,
@@ -422,6 +479,7 @@ class GridDCAStrategy:
         order_type_str = "BUY STOP" if order_type == self.mt5_api.ORDER_TYPE_BUY_STOP else "SELL STOP"
         self.logger.info(f"✅ :: {comment} :: {order_type_str} order placed: {volume} lots at {price:.2f}, TP: {tp_price:.2f}")
         return result
+    
     def get_order_status_str(self, key, val):
         """Format a single order status string."""
         msg = ''
@@ -439,6 +497,7 @@ class GridDCAStrategy:
                 order_status = getattr(order_obj, 'status', '')
                 price = round(price, 3) if price is not None else None
                 volume = round(volume, 2) if volume is not None else None
+            
             if order_id is not None and order_id in self.notified_filled:
                 status_str = '✅'
             elif status == 'placed' and order_status != 'filled':
@@ -454,6 +513,7 @@ class GridDCAStrategy:
         except Exception as e:
             self.logger.error(f"ERROR in get_order_status_str: {e}")
         return msg
+    
     def get_all_order_status_str(self):
         """Get formatted status string for all orders."""
         all_status_report = ''
@@ -462,6 +522,7 @@ class GridDCAStrategy:
                 side, idx = x.split('_')
                 idx = int(idx)
                 return (0, idx)
+            
             sorted_keys = sorted(self.detail_orders.keys(), key=order_sort_key)
             all_order_status_lines = []
             for key in sorted_keys:
@@ -472,6 +533,7 @@ class GridDCAStrategy:
         except Exception as e:
             self.logger.error(f"Error in get_all_order_status_str: {e}")
         return all_status_report
+    
     def get_filled_orders_list(self):
         """Get list of filled orders with details."""
         filled_orders = []
@@ -508,6 +570,7 @@ class GridDCAStrategy:
         except Exception as e:
             self.logger.error(f"Error getting filled orders list: {e}")
         return filled_orders
+    
     def get_filled_orders_summary(self):
         """Get formatted summary of filled orders."""
         filled_orders = self.get_filled_orders_list()
@@ -527,6 +590,7 @@ class GridDCAStrategy:
             for o in sell_orders:
                 summary_lines.append(f"  • {o['comment']} | Price: {o['price']} | Vol: {o['volume']}")
         return '\n'.join(summary_lines)
+    
     def check_consecutive_orders_pattern(self):
         """Detect consecutive filled-order patterns."""
         filled_orders = self.get_filled_orders_list()
@@ -552,6 +616,7 @@ class GridDCAStrategy:
             "pattern_detected": pattern_detected,
             "total_filled": len(filled_orders),
         }
+    
     def monitor_drawdown(self):
         """Monitor and update max drawdown."""
         try:
@@ -561,6 +626,7 @@ class GridDCAStrategy:
                 self.logger.info(f"New max drawdown recorded: {self.max_drawdown}")
         except Exception as e:
             self.logger.error(f"Error monitoring drawdown: {e}")
+    
     def drawdown_report(self):
         """Generate drawdown report string."""
         msg = ''
@@ -572,87 +638,32 @@ class GridDCAStrategy:
         except Exception as e:
             self.logger.error(f"Error generating drawdown report: {e}")
         return msg
+    
     def run_at_index(self, symbol, amount, index, price=0):
         """
         Main grid placement logic for given index.
         Places 3 layers of buy stop and 3 layers of sell stop orders.
         """
         try:
-            # Blackout check (GMT+7) - Enhanced for cycle completion with weekend support
+            # Blackout check (GMT+7)
             gmt_plus_7 = timezone(timedelta(hours=7))
             now_gmt7 = datetime.now(gmt_plus_7)
             current_hour = now_gmt7.hour
-            current_weekday = now_gmt7.weekday()  # Monday=0, Sunday=6
-            # Time-based blackout (2am-6am)
-            time_blackout = (
+            in_blackout = (
                 self.blackout_enabled and (
-                    (self.blackout_start <= self.blackout_end and self.blackout_start <= current_hour < self.blackout_end) or
-                    (self.blackout_start > self.blackout_end and (current_hour >= self.blackout_start or current_hour < self.blackout_end))
+                    (self.blackout_start <= self.blackout_end and self.blackout_start <= current_hour <= self.blackout_end) or
+                    (self.blackout_start > self.blackout_end and (current_hour >= self.blackout_start or current_hour <= self.blackout_end))
                 )
             )
-            # Weekend blackout (Saturday=5, Sunday=6)
-            weekend_blackout = self.weekend_blackout_enabled and current_weekday in [5, 6]
-            # Combined blackout condition
-            in_blackout = time_blackout or weekend_blackout
             if in_blackout:
-                # Check if this is continuing an existing strategy cycle
-                has_active_positions = False
-                has_pending_orders = False
-                try:
-                    # Check for active positions with our magic number
-                    positions = self.mt5_api.positions_get(symbol=symbol)
-                    if positions:
-                        for pos in positions:
-                            if getattr(pos, 'magic', None) == self.magic_number:
-                                has_active_positions = True
-                                break
-                    # Check for pending orders with our magic number
-                    orders = self.mt5_api.orders_get(symbol=symbol)
-                    if orders:
-                        for order in orders:
-                            if getattr(order, 'magic', None) == self.magic_number:
-                                has_pending_orders = True
-                                break
-                    # Also check our detail_orders for active entries
-                    for key, val in self.detail_orders.items():
-                        if val.get('status') == 'placed':
-                            has_pending_orders = True
-                            break
-                except Exception as e:
-                    self.logger.debug(f"Error checking positions/orders during blackout: {e}")
-                # Allow continuation if we have active strategy elements, block new starts
-                strategy_is_active = has_active_positions or has_pending_orders
-                if strategy_is_active and self.blackout_allow_cycle_completion:
-                    # Allow continuing current strategy cycle during blackout
-                    blackout_reason = "Weekend" if weekend_blackout else f"Time {self.blackout_start:02d}:00-{self.blackout_end:02d}:00"
-                    self.logger.info(f"🟡 Blackout active ({blackout_reason}) but continuing existing strategy cycle (positions: {has_active_positions}, orders: {has_pending_orders})")
-                    if self.telegram_bot and price > 0:  # Only notify on order fills (price > 0), not periodic checks
-                        self.telegram_bot.send_message(
-                            f"🟡 Blackout active ({blackout_reason}) - continuing existing strategy cycle\n"
-                            f"📊 Completing current trades until TP\n"
-                            f"⏹️ No new strategy cycles will start",
-                            chat_id=self.telegram_chat_id,
-                        )
-                else:
-                    # Block new strategy starts during blackout
-                    if weekend_blackout:
-                        blackout_msg = f"⛔️ Weekend blackout active (Saturday-Sunday). New strategy cycles blocked, monitoring existing positions."
-                        telegram_msg = (
-                            f"⛔️ Weekend blackout active (Saturday-Sunday)\n"
-                            f"📊 New strategy cycles suspended\n"
-                            f"👁️ Still monitoring existing positions for TP/SL"
-                        )
-                    else:
-                        blackout_msg = f"⛔️ Time-based blackout active {self.blackout_start:02d}:00-{self.blackout_end:02d}:00 GMT+7. New strategy cycles blocked, monitoring existing positions."
-                        telegram_msg = (
-                            f"⛔️ Time-based blackout active {self.blackout_start:02d}:00-{self.blackout_end:02d}:00 GMT+7\n"
-                            f"📊 New strategy cycles suspended\n"
-                            f"👁️ Still monitoring existing positions for TP/SL"
-                        )
-                    self.logger.info(blackout_msg)
-                    if self.telegram_bot:
-                        self.telegram_bot.send_message(telegram_msg, chat_id=self.telegram_chat_id)
-                    return
+                self.logger.info(f"⛔️ Blackout window active {self.blackout_start:02d}-{self.blackout_end:02d} GMT+7. Skipping grid build.")
+                if self.telegram_bot:
+                    self.telegram_bot.send_message(
+                        f"⛔️ Blackout window active {self.blackout_start:02d}-{self.blackout_end:02d} GMT+7. Skipping grid build.",
+                        chat_id=self.telegram_chat_id,
+                    )
+                return
+            
             current_equity = self.get_current_equity()
             current_free_margin = self.get_current_free_margin()
             if current_equity < self.start_balance - self.max_reduce_balance:
@@ -660,16 +671,19 @@ class GridDCAStrategy:
                 if self.telegram_bot:
                     self.telegram_bot.send_message(f"⛔️ Current equity {current_equity} has reduced more than {self.max_reduce_balance} from start balance {self.start_balance}. Stopping further trades.", chat_id=self.telegram_chat_id)
                 return
+            
             if current_free_margin < self.min_free_margin:
                 self.logger.error(f"⛔️ Current free margin {current_free_margin} is below minimum required {self.min_free_margin}. Stopping further trades.")
                 if self.telegram_bot:
                     self.telegram_bot.send_message(f"⛔️ Current free margin {current_free_margin} is below minimum required {self.min_free_margin}. Stopping further trades.", chat_id=self.telegram_chat_id)
                 return
+            
             # Get current price from MT5
             tick = self.mt5_api.symbol_info_tick(symbol)
             if not tick:
                 self.logger.error(f"Could not get tick for {symbol}")
                 return
+            
             # Spread cap
             try:
                 spread = (tick.ask - tick.bid) if (hasattr(tick, 'ask') and hasattr(tick, 'bid')) else 0.0
@@ -683,14 +697,17 @@ class GridDCAStrategy:
                         chat_id=self.telegram_chat_id,
                     )
                 return
+            
             if not price:
                 price = (tick.bid + tick.ask) / 2
             self.logger.info(f"run_at_index: Current price for {symbol}: {price:.2f}")
+            
             percent0 = abs(index) / 100 * self.percent_scale
             percent1 = abs(index + 1) / 100 * self.percent_scale
             percent2 = abs(index + 2) / 100 * self.percent_scale
             percent_1 = abs(index - 1) / 100 * self.percent_scale
             percent_2 = abs(index - 2) / 100 * self.percent_scale
+            
             # Pattern-based exposure adjustment
             pypass_buy1 = False
             pypass_sell1 = False
@@ -705,6 +722,7 @@ class GridDCAStrategy:
                         pypass_sell1 = True
             except Exception as e:
                 self.logger.debug(f"consecutive pattern check error: {e}")
+            
             # Calculate buy stop entries and TP
             buy_entry_1 = price + self.delta_enter_price * (1 + percent0)
             buy_tp_1 = buy_entry_1 + self.target_profit * (1 + percent0)
@@ -712,6 +730,7 @@ class GridDCAStrategy:
             buy_tp_2 = buy_entry_2 + self.target_profit * (1 + percent1)
             buy_entry_3 = price + self.target_profit * (1 + percent0) + self.target_profit * (1 + percent1) + self.delta_enter_price * (1 + percent2)
             buy_tp_3 = buy_entry_3 + self.target_profit * (1 + percent2)
+            
             # Calculate sell stop entries and TP
             sell_entry_1 = price - self.delta_enter_price * (1 + percent0)
             sell_tp_1 = sell_entry_1 - self.target_profit * (1 + percent0)
@@ -719,13 +738,16 @@ class GridDCAStrategy:
             sell_tp_2 = sell_entry_2 - self.target_profit * (1 + percent_1)
             sell_entry_3 = price - self.target_profit * (1 + percent0) - self.target_profit * (1 + percent_1) - self.delta_enter_price * (1 + percent_2)
             sell_tp_3 = sell_entry_3 - self.target_profit * (1 + percent_2)
+            
             # Use trade amount scaled by FIBONACCI_LEVELS
             fibb_amount_1 = amount * self.fibonacci_levels[abs(index)]
             fibb_amount_2 = amount * self.fibonacci_levels[abs(index+1)] if abs(index+1) < len(self.fibonacci_levels) else amount
             fibb_amount_3 = amount * self.fibonacci_levels[abs(index+2)] if abs(index+2) < len(self.fibonacci_levels) else amount
+            
             fibs_amount_1 = amount * self.fibonacci_levels[abs(index)]
             fibs_amount_2 = amount * self.fibonacci_levels[abs(index-1)] if abs(index-1) < len(self.fibonacci_levels) else amount
             fibs_amount_3 = amount * self.fibonacci_levels[abs(index-2)] if abs(index-2) < len(self.fibonacci_levels) else amount
+            
             # Capacity caps for positions/orders
             try:
                 pos_count = 0
@@ -748,6 +770,7 @@ class GridDCAStrategy:
                     return
             except Exception as e:
                 self.logger.debug(f"Capacity cap check error: {e}")
+            
             # Place buy stop orders
             buy_comment_1 = f"buy_{index}"
             buy_comment_2 = f"buy_{index+1}"
@@ -755,6 +778,7 @@ class GridDCAStrategy:
             sell_comment_1 = f"sell_{index}"
             sell_comment_2 = f"sell_{index-1}"
             sell_comment_3 = f"sell_{index-2}"
+            
             new_orders = []
             if self.detail_orders.get(buy_comment_1, {}).get('status') != 'placed':
                 if not pypass_buy1:
@@ -768,6 +792,7 @@ class GridDCAStrategy:
                     if res_sell_1:
                         self.detail_orders[sell_comment_1] = {'status': 'placed', 'order': res_sell_1}
                         new_orders.append(res_sell_1)
+            
             if self.detail_orders.get(buy_comment_2, {}).get('status') != 'placed':
                 res_buy_2 = self.place_pending_order(symbol, self.mt5_api.ORDER_TYPE_BUY_STOP, buy_entry_2, buy_tp_2, fibb_amount_2, buy_comment_2)
                 if res_buy_2:
@@ -778,6 +803,7 @@ class GridDCAStrategy:
                 if res_sell_2:
                     self.detail_orders[sell_comment_2] = {'status': 'placed', 'order': res_sell_2}
                     new_orders.append(res_sell_2)
+            
             if self.detail_orders.get(buy_comment_3, {}).get('status') != 'placed':
                 res_buy_3 = self.place_pending_order(symbol, self.mt5_api.ORDER_TYPE_BUY_STOP, buy_entry_3, buy_tp_3, fibb_amount_3, buy_comment_3)
                 if res_buy_3:
@@ -788,6 +814,7 @@ class GridDCAStrategy:
                 if res_sell_3:
                     self.detail_orders[sell_comment_3] = {'status': 'placed', 'order': res_sell_3}
                     new_orders.append(res_sell_3)
+            
             # Show all new orders
             if len(new_orders) > 0 and self.telegram_bot:
                 self.telegram_bot.send_message(
@@ -797,6 +824,7 @@ class GridDCAStrategy:
                 self.logger.info(f"Grid orders placed for index {index}: buy/sell stops at {buy_entry_1:.2f}, {buy_entry_2:.2f}, {buy_entry_3:.2f}, {sell_entry_1:.2f}, {sell_entry_2:.2f}, {sell_entry_3:.2f}")
         except Exception as e:
             self.logger.error(f"ERROR :: {e}")
+    
     def close_all_positions(self, symbol):
         """Close all strategy positions."""
         try:
@@ -804,6 +832,7 @@ class GridDCAStrategy:
             if not positions:
                 self.logger.info(f"No open positions to close for {symbol}.")
                 return
+            
             strategy_order_ids = set()
             for key, val in self.detail_orders.items():
                 if val.get('status') == 'placed' and val.get('order') is not None:
@@ -811,14 +840,17 @@ class GridDCAStrategy:
                     oid = getattr(order_obj, 'order', None)
                     if oid is not None:
                         strategy_order_ids.add(oid)
+            
             positions_closed = 0
             for pos in positions:
                 ticket = getattr(pos, 'ticket', None)
                 volume = getattr(pos, 'volume', None)
                 type_ = getattr(pos, 'type', None)
+                
                 if ticket is None or volume is None or type_ is None:
                     self.logger.warning(f"Could not get ticket/volume/type for position: {pos}")
                     continue
+                
                 if type_ == self.mt5_api.POSITION_TYPE_BUY:
                     close_type = self.mt5_api.ORDER_TYPE_SELL
                 elif type_ == self.mt5_api.POSITION_TYPE_SELL:
@@ -826,6 +858,7 @@ class GridDCAStrategy:
                 else:
                     self.logger.warning(f"Unknown position type for ticket {ticket}: {type_}")
                     continue
+                
                 filling_modes = [self.mt5_api.ORDER_FILLING_IOC, self.mt5_api.ORDER_FILLING_FOK, self.mt5_api.ORDER_FILLING_RETURN]
                 success = False
                 for fill_mode in filling_modes:
@@ -853,9 +886,11 @@ class GridDCAStrategy:
                         self.logger.error(f"Failed to close position {ticket} (mode {fill_mode}): retcode {result.retcode}, comment: {result.comment}")
                 if not success:
                     self.logger.error(f"❌ Could not close position {ticket} for {symbol} with any supported filling mode.")
+            
             self.logger.info(f"Strategy positions closed: {positions_closed} out of {len(positions)} total positions for {symbol}")
         except Exception as e:
             self.logger.error(f"Error closing strategy positions: {e}")
+    
     def cancel_all_pending_orders(self, symbol):
         """Cancel all strategy pending orders."""
         try:
@@ -863,6 +898,7 @@ class GridDCAStrategy:
             if not orders:
                 self.logger.info(f"No pending orders to cancel for {symbol}.")
                 return
+            
             strategy_order_ids = set()
             for key, val in self.detail_orders.items():
                 if val.get('status') == 'placed' and val.get('order') is not None:
@@ -870,12 +906,14 @@ class GridDCAStrategy:
                     oid = getattr(order_obj, 'order', None)
                     if oid is not None:
                         strategy_order_ids.add(oid)
+            
             orders_cancelled = 0
             for order in orders:
                 ticket = getattr(order, 'ticket', None)
                 if ticket is None:
                     self.logger.warning(f"Could not get ticket for order: {order}")
                     continue
+                
                 request = {
                     "action": self.mt5_api.TRADE_ACTION_REMOVE,
                     "order": ticket,
@@ -891,183 +929,101 @@ class GridDCAStrategy:
                 else:
                     self.logger.info(f"✅ Cancelled strategy order {ticket} for {symbol}")
                     orders_cancelled += 1
+            
             self.logger.info(f"Strategy orders cancelled: {orders_cancelled} out of {len(orders)} total orders for {symbol}")
         except Exception as e:
             self.logger.error(f"Error cancelling strategy pending orders: {e}")
-    def execute_max_reduce_emergency_stop(self, symbol, current_equity):
-        """Execute emergency stop when max reduce threshold is breached."""
-        try:
-            self.logger.critical(f"🚨 MAX REDUCE EMERGENCY STOP TRIGGERED!")
-            self.logger.critical(f"Current equity: {current_equity:.2f}, Threshold: {self.max_reduce_threshold_equity:.2f}")
-            
-            # Record metrics
-            self.max_reduce_triggered = True
-            self.max_reduce_trigger_time = datetime.now()
-            self.max_reduce_peak_drawdown = self.start_balance - current_equity
-            
-            # Close all positions
-            positions_closed = self.close_all_positions(symbol)
-            self.logger.info(f"Emergency stop: Closed {positions_closed} positions")
-            
-            # Cancel all pending orders  
-            orders_cancelled = self.cancel_all_pending_orders(symbol)
-            self.logger.info(f"Emergency stop: Cancelled {orders_cancelled} pending orders")
-            
-            # Pause the strategy
-            self.bot_paused = True
-            
-            # Calculate loss statistics
-            total_loss = self.start_balance - current_equity
-            loss_percentage = (total_loss / self.start_balance) * 100 if self.start_balance > 0 else 0
-            
-            # Send detailed Telegram notification
-            if self.telegram_bot and self.telegram_chat_id:
-                msg = (
-                    f"🚨 <b>MAX REDUCE EMERGENCY STOP</b>\n\n"
-                    f"• Start balance: ${self.start_balance:.2f}\n"
-                    f"• Current equity: ${current_equity:.2f}\n"
-                    f"• Total loss: ${total_loss:.2f} ({loss_percentage:.1f}%)\n"
-                    f"• Max reduce limit: ${self.max_reduce_balance:.2f}\n"
-                    f"• Trigger time: {self.max_reduce_trigger_time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                    f"✅ All positions closed\n"
-                    f"✅ All pending orders cancelled\n"
-                    f"✅ Strategy paused\n\n"
-                    f"Send /start to resume (will reset start balance)"
-                )
-                self.telegram_bot.send_message(msg, chat_id=self.telegram_chat_id)
-            
-            self.logger.info("Max reduce emergency stop completed successfully")
-            
-        except Exception as e:
-            self.logger.error(f"Error during max reduce emergency stop: {e}")
-            if self.telegram_bot and self.telegram_chat_id:
-                self.telegram_bot.send_message(
-                    f"❌ Error during max reduce emergency stop: {str(e)}", 
-                    chat_id=self.telegram_chat_id
-                )
-    def send_max_reduce_warning(self, current_equity, current_drawdown, max_allowed_drawdown):
-        """Send warning when approaching max reduce limit."""
-        try:
-            warning_percentage = (current_drawdown / max_allowed_drawdown) * 100
-            remaining_buffer = max_allowed_drawdown - current_drawdown
-            
-            msg = (
-                f"⚠️ <b>MAX REDUCE WARNING</b>\n\n"
-                f"• Approaching drawdown limit!\n"
-                f"• Current equity: {current_equity:.2f}\n"
-                f"• Current drawdown: {current_drawdown:.2f} ({warning_percentage:.1f}% of limit)\n"
-                f"• Remaining buffer: {remaining_buffer:.2f}\n"
-                f"• Emergency threshold: {self.max_reduce_threshold_equity:.2f}\n\n"
-                f"🚨 Emergency stop will trigger if equity drops below threshold"
-            )
-            
-            if self.telegram_bot and self.telegram_chat_id:
-                self.telegram_bot.send_message(msg, chat_id=self.telegram_chat_id)
-            
-            self.logger.warning(f"MAX REDUCE WARNING: {warning_percentage:.1f}% of limit reached")
-            
-        except Exception as e:
-            self.logger.error(f"Error sending max reduce warning: {e}")
-    def check_max_reduce_threshold(self, symbol):
-        """Check if current equity has breached the max reduce threshold."""
-        if not self.max_reduce_enabled or self.max_reduce_triggered:
-            return False
-        try:
-            current_equity = self.get_current_equity()  # Using actual equity for real-time monitoring
-            current_drawdown = self.start_balance - current_equity
-            
-            # Track peak drawdown
-            if current_drawdown > self.max_reduce_peak_drawdown:
-                self.max_reduce_peak_drawdown = current_drawdown
-            
-            # Check for emergency stop
-            if current_equity <= self.max_reduce_threshold_equity:
-                self.execute_max_reduce_emergency_stop(symbol, current_equity)
-                return True
-            
-            # Check for warning threshold (80% of way to limit)
-            if not self.max_reduce_warning_sent:
-                if self.max_reduce_use_percentage and self.max_reduce_percentage:
-                    max_allowed_drawdown = self.start_balance * (self.max_reduce_percentage / 100.0)
-                else:
-                    max_allowed_drawdown = self.max_reduce_balance
-                
-                warning_drawdown = max_allowed_drawdown * self.max_reduce_warning_threshold
-                
-                if current_drawdown >= warning_drawdown:
-                    self.send_max_reduce_warning(current_equity, current_drawdown, max_allowed_drawdown)
-                    self.max_reduce_warning_sent = True
-            else:
-                # Check if equity has recovered enough to reset warning
-                if self.max_reduce_use_percentage and self.max_reduce_percentage:
-                    max_allowed_drawdown = self.start_balance * (self.max_reduce_percentage / 100.0)
-                else:
-                    max_allowed_drawdown = self.max_reduce_balance
-                
-                recovery_threshold = max_allowed_drawdown * (self.max_reduce_warning_threshold - 0.1)  # 10% recovery buffer
-                
-                if current_drawdown < recovery_threshold:
-                    self.max_reduce_warning_sent = False  # Reset warning when equity recovers
-                    self.logger.info(f"Max reduce warning reset - equity recovered to ${current_equity:.2f}")
-                    
-        except Exception as e:
-            self.logger.error(f"Error checking max reduce threshold: {e}")
-        return False
+    
     def run(self):
         """
         Main strategy execution loop.
         Monitors filled orders, TP reached, handles Telegram commands, and manages trade cycles.
+        For FTMO: Starts paused and waits for user /start command.
         """
-        self.logger.info(f"=== Grid DCA Strategy for {self.trade_symbol} ===")
+        self.logger.info(f"=== Grid DCA Strategy for {self.trade_symbol} (FTMO Mode) ===")
         script_start_time = datetime.now()
         self.session_start_time = script_start_time
+        
         try:
             symbol = self.trade_symbol
             trade_amount = self.trade_amount
             self.tp_expected = trade_amount * 1000
+            
             self.logger.info(f"✅ Connected to MT5 Account (Symbol: {symbol}, Trade Amount: {trade_amount})")
+            self.logger.info(f"🔶 FTMO Mode: Bot is PAUSED - Send /start to begin trading")
+            
             if self.telegram_bot:
-                self.telegram_bot.send_message(
-                    f"✅ Connected to MT5 Account (Symbol: {symbol}, Trade Amount: {trade_amount})",
-                    chat_id=self.telegram_chat_id
+                initial_msg = (
+                    f"✅ <b>Connected to MT5 Account</b>\n\n"
+                    f"📊 <b>Trading Setup:</b>\n"
+                    f"• Symbol: {symbol}\n"
+                    f"• Trade Amount: {trade_amount}\n\n"
+                    f"🔶 <b>FTMO Mode Active</b>\n"
+                    f"• Bot is currently PAUSED\n"
+                    f"• Send /start to begin trading\n"
+                    f"• All risk management features active\n\n"
+                    f"⚠️ <b>Ready to trade - awaiting your command!</b>"
                 )
-            # Log blackout schedule
-            blackout_msg = ""
-            if self.blackout_enabled or self.weekend_blackout_enabled:
-                blackout_msg = "🕐 Risk management blackout schedule:\n"
-                if self.blackout_enabled:
-                    blackout_msg += f"• Time-based: {self.blackout_start:02d}:00-{self.blackout_end:02d}:00 GMT+7 daily\n"
-                if self.weekend_blackout_enabled:
-                    blackout_msg += f"• Weekend: Saturday-Sunday GMT+7\n"
-                blackout_msg += f"📊 New strategy cycles suspended during blackout\n"
-                self.logger.info(blackout_msg)
-                if self.telegram_bot:
-                    self.telegram_bot.send_message(blackout_msg, chat_id=self.telegram_chat_id)
+                self.telegram_bot.send_message(initial_msg, chat_id=self.telegram_chat_id)
+            
             # Get start balance
             start_balance = self.get_current_balance()
             self.start_balance = start_balance
-            # Calculate max reduce threshold
-            if self.max_reduce_enabled:
-                if self.max_reduce_use_percentage and self.max_reduce_percentage:
-                    # Percentage-based limit
-                    max_reduce_amount = self.start_balance * (self.max_reduce_percentage / 100.0)
-                    self.max_reduce_threshold_equity = self.start_balance - max_reduce_amount
-                    self.logger.info(f"Max reduce protection enabled (percentage): {self.max_reduce_percentage}% = ${max_reduce_amount:.2f}, threshold={self.max_reduce_threshold_equity:.2f}")
-                else:
-                    # Fixed amount limit
-                    self.max_reduce_threshold_equity = self.start_balance - self.max_reduce_balance
-                    self.logger.info(f"Max reduce protection enabled (fixed): threshold={self.max_reduce_threshold_equity:.2f}, max_reduce={self.max_reduce_balance}")
+            
             # Initialize balance/equity logging
             self.initialize_balance_log()
-            # Initial grid placement
-            self.run_at_index(symbol, trade_amount, index=self.current_idx, price=0)
             notified_tp = set()
             closed_pnl = 0
+            
             idx = 0
             while True:
                 # Handle Telegram commands
                 if self.telegram_bot:
                     self.handle_telegram_command()
+                
+                # PROP FIRM EQUITY PROTECTION - Check first (highest priority)
+                try:
+                    if self.min_equity_threshold is not None and not self.equity_emergency_triggered:
+                        current_equity = self.get_current_equity()
+                        if current_equity <= self.min_equity_threshold:
+                            self.equity_emergency_triggered = True
+                            self.bot_paused = True
+                            
+                            emergency_msg = (
+                                f"🚨🔴🚨 <b>PROP FIRM EMERGENCY STOP</b> 🚨🔴🚨\n\n"
+                                f"┌─────────────────────────────┐\n"
+                                f"│  🏛️ <b>EQUITY PROTECTION ALERT</b>  │\n"
+                                f"└─────────────────────────────┘\n\n"
+                                f"💰 <b>Account Status:</b>\n"
+                                f"┣━ Current Equity: <code>${current_equity:.2f}</code>\n"
+                                f"┣━ Minimum Threshold: <code>${self.min_equity_threshold:.2f}</code>\n"
+                                f"┗━ ⚠️ Violation: <code>-${self.min_equity_threshold - current_equity:.2f}</code>\n\n"
+                                f"🛑 <b>EMERGENCY ACTIONS EXECUTED:</b>\n"
+                                f"┣━ ❌ Closing ALL positions immediately\n"
+                                f"┣━ 🗑️ Cancelling ALL pending orders\n"
+                                f"┗━ ⏹️ Strategy STOPPED permanently\n\n"
+                                f"⚠️ <b>MANUAL INTERVENTION REQUIRED</b>\n"
+                                f"🔒 Bot will remain STOPPED until manually restarted."
+                            )
+                            
+                            self.logger.critical(f"PROP FIRM EMERGENCY: Equity ${current_equity:.2f} <= ${self.min_equity_threshold:.2f}")
+                            
+                            # Close all positions and cancel all orders immediately
+                            try:
+                                self.close_all_positions(symbol)
+                                self.cancel_all_pending_orders(symbol)
+                                self.logger.warning("Emergency closure: All positions closed and orders cancelled")
+                            except Exception as close_error:
+                                self.logger.error(f"Error during emergency closure: {close_error}")
+                            
+                            # Send emergency notification
+                            if self.telegram_bot:
+                                self.telegram_bot.send_message(emergency_msg, chat_id=self.telegram_chat_id, pin_msg=True, disable_notification=False)
+                            
+                            # Continue to pause state - bot will remain stopped
+                except Exception as e:
+                    self.logger.debug(f"Equity protection check error: {e}")
+                
                 # Enforce scheduled pause
                 try:
                     if self.stop_at_datetime is not None:
@@ -1081,6 +1037,7 @@ class GridDCAStrategy:
                                 self.telegram_bot.send_message(msg, chat_id=self.telegram_chat_id)
                 except Exception as e:
                     self.logger.debug(f"Scheduled pause check error: {e}")
+                
                 # Enforce max drawdown auto-pause
                 try:
                     if self.max_dd_threshold is not None and self.start_balance:
@@ -1098,81 +1055,114 @@ class GridDCAStrategy:
                                     self.telegram_bot.send_message(warn, chat_id=self.telegram_chat_id, disable_notification=False)
                 except Exception as e:
                     self.logger.debug(f"Drawdown threshold check error: {e}")
-                # Check blackout period transitions for notifications
+
+                # Automatic Trading Halt Check (4AM-6:30AM GMT+7 News Protection)
                 try:
-                    if self.blackout_enabled or self.weekend_blackout_enabled:
+                    if self.trading_halt_enabled:
                         gmt_plus_7 = timezone(timedelta(hours=7))
                         now_gmt7 = datetime.now(gmt_plus_7)
                         current_hour = now_gmt7.hour
-                        current_weekday = now_gmt7.weekday()  # Monday=0, Sunday=6
-                        # Check current blackout status
-                        time_blackout = (
-                            self.blackout_enabled and (
-                                (self.blackout_start <= self.blackout_end and self.blackout_start <= current_hour < self.blackout_end) or
-                                (self.blackout_start > self.blackout_end and (current_hour >= self.blackout_start or current_hour < self.blackout_end))
-                            )
+                        current_minute = now_gmt7.minute
+                        
+                        # Check if we're in trading halt period (4:00 AM to 6:30 AM)
+                        in_halt_period = (
+                            (current_hour == self.trading_halt_start) or  # 4:00-4:59 AM
+                            (self.trading_halt_start < current_hour < self.trading_halt_end) or  # 5:00-5:59 AM  
+                            (current_hour == self.trading_halt_end and current_minute < self.trading_halt_end_minutes)  # 6:00-6:29 AM
                         )
-                        weekend_blackout = self.weekend_blackout_enabled and current_weekday in [5, 6]
-                        currently_in_blackout = time_blackout or weekend_blackout
-                        # Check for blackout period transitions
-                        if currently_in_blackout and not self.in_blackout_period:
-                            # Entering blackout period
-                            if weekend_blackout and not time_blackout:
-                                msg = f"🌙 Entering weekend blackout (Saturday-Sunday GMT+7)\n📊 New strategy cycles suspended\n👁️ Monitoring existing positions"
-                            elif time_blackout and not weekend_blackout:
-                                msg = f"🌙 Entering time-based blackout ({self.blackout_start:02d}:00-{self.blackout_end:02d}:00 GMT+7)\n📊 New strategy cycles suspended\n👁️ Monitoring existing positions"
+                        
+                        # Update trading halt status and notify if changed
+                        previous_halt_status = self.trading_halt_active
+                        self.trading_halt_active = in_halt_period
+                        
+                        # Notify status change
+                        if previous_halt_status != self.trading_halt_active:
+                            if self.trading_halt_active:
+                                halt_msg = (
+                                    f"🛑 <b>Trading Halt ACTIVATED</b>\n\n"
+                                    f"┌─────────────────────────────┐\n"
+                                    f"│  📰 <b>News Protection Period</b>  │\n"
+                                    f"└─────────────────────────────┘\n\n"
+                                    f"🕐 <b>Halt Schedule:</b>\n"
+                                    f"┣━ 🚫 No new orders: <code>04:00-06:30 GMT+7</code>\n"
+                                    f"┣━ ⏰ Current time: <code>{current_hour:02d}:{current_minute:02d} GMT+7</code>\n"
+                                    f"┗━ 🔄 Auto-resume at: <code>06:30 GMT+7</code>\n\n"
+                                    f"✅ <b>Active positions and orders remain untouched</b>\n"
+                                    f"🛡️ <b>Risk management continues normally</b>"
+                                )
+                                self.logger.info(f"🛑 Trading halt ACTIVATED at {current_hour:02d}:{current_minute:02d} GMT+7")
                             else:
-                                msg = f"🌙 Entering combined blackout (Weekend + {self.blackout_start:02d}:00-{self.blackout_end:02d}:00 GMT+7)\n📊 New strategy cycles suspended\n👁️ Monitoring existing positions"
-                            self.logger.info(msg)
+                                halt_msg = (
+                                    f"✅ <b>Trading Halt DEACTIVATED</b>\n\n"
+                                    f"┌─────────────────────────────┐\n"
+                                    f"│  🟢 <b>Normal Trading Resumed</b>  │\n"
+                                    f"└─────────────────────────────┘\n\n"
+                                    f"🕐 <b>Status:</b>\n"
+                                    f"┣━ ✅ New orders: <code>ENABLED</code>\n"
+                                    f"┣━ ⏰ Current time: <code>{current_hour:02d}:{current_minute:02d} GMT+7</code>\n"
+                                    f"┗━ 📈 Strategy: <code>ACTIVE</code>\n\n"
+                                    f"🚀 <b>Bot ready to create new orders based on strategy</b>"
+                                )
+                                self.logger.info(f"✅ Trading halt DEACTIVATED at {current_hour:02d}:{current_minute:02d} GMT+7 - Normal trading resumed")
+                            
                             if self.telegram_bot:
-                                self.telegram_bot.send_message(msg, chat_id=self.telegram_chat_id)
-                            self.in_blackout_period = True
-                        elif not currently_in_blackout and self.in_blackout_period:
-                            # Exiting blackout period
-                            day_name = now_gmt7.strftime('%A')
-                            msg = f"☀️ Exiting blackout period - {day_name} {now_gmt7.strftime('%H:%M')} GMT+7\n📊 Normal strategy cycles resumed\n🕐 Next blackout: "
-                            # Calculate next blackout info
-                            if self.weekend_blackout_enabled and current_weekday < 5:  # Weekday, weekend coming
-                                days_until_weekend = 5 - current_weekday  # Days until Saturday
-                                msg += f"Weekend (in {days_until_weekend} day{'s' if days_until_weekend > 1 else ''})"
-                            elif self.blackout_enabled:  # Time-based blackout info
-                                if current_hour < self.blackout_start:
-                                    hours_until = self.blackout_start - current_hour
-                                    msg += f"{self.blackout_start:02d}:00-{self.blackout_end:02d}:00 (in {hours_until}h)"
-                                else:
-                                    hours_until = 24 - current_hour + self.blackout_start
-                                    msg += f"{self.blackout_start:02d}:00-{self.blackout_end:02d}:00 (in {hours_until}h)"
-                            self.logger.info(msg)
-                            if self.telegram_bot:
-                                self.telegram_bot.send_message(msg, chat_id=self.telegram_chat_id)
-                            self.in_blackout_period = False
+                                self.telegram_bot.send_message(halt_msg, chat_id=self.telegram_chat_id, disable_notification=False)
                 except Exception as e:
-                    self.logger.debug(f"Blackout transition check error: {e}")
-                # Check max reduce emergency stop threshold
-                if self.check_max_reduce_threshold(symbol):
-                    continue  # Emergency stop triggered, continue to next iteration
+                    self.logger.debug(f"Trading halt time check error: {e}")
+
                 # Check if bot is paused
                 if self.bot_paused:
                     if idx % 1000 == 0:
-                        self.logger.info("Bot is paused. Waiting for /start command...")
+                        if self.equity_emergency_triggered:
+                            self.logger.critical("PROP FIRM EMERGENCY STOP: Equity threshold breached - bot permanently stopped")
+                        elif self.equity_threshold_required and self.min_equity_threshold is None:
+                            self.logger.info("FTMO Mode: Equity protection setup required. Use /setminequity command...")
+                        elif not self.user_started:
+                            self.logger.info("FTMO Mode: Bot is paused. Send /start command to begin trading...")
+                        else:
+                            self.logger.info("Bot is paused. Send /start command to resume...")
                     time.sleep(1)
                     idx += 1
                     continue
-                # Update list of open order IDs
+
+                # Check various halt conditions before placing new orders
+                skip_new_orders = False
+                skip_reason = ""
+                
+                if self.trading_halt_active:
+                    skip_new_orders = True
+                    skip_reason = "trading halt (4AM-6:30AM news protection)"
+                elif self.blackout_paused:
+                    skip_new_orders = True
+                    skip_reason = "blackout window"
+                elif self.quiet_hours_enabled and self.is_quiet_hours():
+                    # Note: quiet hours reduces trade amount but doesn't skip orders
+                    pass
+                
+                # Skip order placement if any halt condition is active
+                if skip_new_orders:
+                    if idx % 100 == 0:  # Log every 100 iterations to avoid spam
+                        self.logger.info(f"Skipping new orders due to {skip_reason}")
+                    time.sleep(1)
+                    idx += 1
+                    continue
                 saved_orders = []
                 for key, val in self.detail_orders.items():
                     if val.get('status') == 'placed' and val.get('order') is not None:
                         saved_orders.append(val['order'].order)
+                
                 idx += 1
                 positions = self.mt5.get_positions()
                 open_pnl = 0
                 for pos in positions:
                     if pos.get('ticket') in saved_orders:
                         open_pnl += pos.get('profit', 0)
+                
                 # Check history for filled orders
                 history = []
                 now = datetime.now()
                 history = self.mt5_api.history_deals_get(script_start_time - timedelta(hours=8), now + timedelta(hours=8))
+                
                 # Check if pending orders filled
                 for oid in saved_orders:
                     if oid not in self.notified_filled:
@@ -1181,6 +1171,7 @@ class GridDCAStrategy:
                             order_price = 0
                             side = '?'
                             matching_key = None
+                            
                             for key, val in self.detail_orders.items():
                                 order_obj = val.get('order')
                                 if hasattr(order_obj, 'order') and order_obj.order == oid:
@@ -1189,6 +1180,7 @@ class GridDCAStrategy:
                                     order_price = order_obj.request.price
                                     matching_key = key
                                     break
+                            
                             # Determine side from comment or key
                             if order_comment and ('buy' in order_comment or 'sell' in order_comment):
                                 side = 'BUY' if 'buy' in order_comment else 'SELL'
@@ -1208,10 +1200,12 @@ class GridDCAStrategy:
                             self.logger.info(f"🔥 :: {order_comment} :: Pending order filled: ID {oid} | {side} | {order_price}")
                             self.notified_filled.add(oid)
                             self.logger.info(f"Filled order IDs: {self.notified_filled}")
+                            
                             all_status_report = self.get_all_order_status_str()
                             msg = f"🔥 <b>Pending order filled - {order_comment}</b>\n"
                             msg += f"ID {oid} | {side} | {order_price:<.2f}\n\n"
                             msg += f"{all_status_report}\n{self.drawdown_report()}\n"
+                            
                             # Add pattern detection info
                             try:
                                 pd = self.check_consecutive_orders_pattern()
@@ -1226,10 +1220,12 @@ class GridDCAStrategy:
                                     msg += f"• Total filled: {pd.get('total_filled', 0)}\n"
                             except Exception as e_pattern:
                                 self.logger.debug(f"Pattern check error: {e_pattern}")
+                            
                             if self.telegram_bot:
                                 self.telegram_bot.send_message(msg, chat_id=self.telegram_chat_id)
                             self.run_at_index(symbol, trade_amount, self.current_idx, price=order_price)
                             self.monitor_drawdown()
+                
                 # Check if positions closed (TP filled)
                 for oid in self.notified_filled:
                     if oid not in notified_tp:
@@ -1247,6 +1243,7 @@ class GridDCAStrategy:
                                     hit_tp_price = order_obj.request.tp
                                     comment = getattr(order_obj, 'comment', '') or ''
                                     order_comment = comment or key  # Fallback to key if comment is empty
+                                    
                                     # Try to determine side from comment first, then from key
                                     if comment and ('buy' in comment or 'sell' in comment):
                                         if 'buy' in comment:
@@ -1283,6 +1280,7 @@ class GridDCAStrategy:
                                     self.current_idx = hit_index + 1
                                 elif hit_side == 'SELL':
                                     self.current_idx = hit_index - 1
+                            
                             self.logger.info(f"❤️ :: {order_comment} :: TP filled: Position ID {oid} closed | P&L: ${pnl:.2f} All Closed P&L: ${closed_pnl:.2f}")
                             self.logger.info(f"TP filled order IDs: {notified_tp}")
                             self.logger.info(f"TP filled: {hit_side} order index {self.current_idx} (ID {oid}) closed. TP price: {hit_tp_price}")
@@ -1292,29 +1290,35 @@ class GridDCAStrategy:
                             msg += f"<b>All Closed P&L:</b> ${closed_pnl:.2f}\n"
                             msg += f"<b>All P&L:</b> ${closed_pnl + open_pnl:.2f}\n"
                             msg += f"\n{self.drawdown_report()}\n"
+                            
                             if self.telegram_bot:
                                 self.telegram_bot.send_message(msg, chat_id=self.telegram_chat_id)
                             self.run_at_index(symbol, trade_amount, self.current_idx, price=0)
                             self.monitor_drawdown()
+                            
                             # Clean up detail_orders entry if we have valid hit_side and hit_index
                             if hit_side is not None and hit_index is not None:
                                 self.logger.info(f"⚠️ :: Deleting detail_orders entry for {hit_side.lower()}_{hit_index}")
                                 self.detail_orders[f"{hit_side.lower()}_{hit_index}"] = {'status': None}
                             else:
                                 self.logger.warning(f"⚠️ :: Could not clean up detail_orders entry - hit_side: {hit_side}, hit_index: {hit_index}, order_comment: {order_comment}")
+                
                 if idx % 50 == 0:
                     self.logger.info(f"Current open positions P&L: ${open_pnl:.2f}")
                     self.logger.info(f"Closed positions (TP filled) P&L: ${closed_pnl:.2f}")
                     self.logger.info(f"All P&L: ${closed_pnl + open_pnl:.2f}")
                     self.logger.info(f"current_idx: {self.current_idx}")
+                
                 # Check if target profit reached
                 if closed_pnl + open_pnl > self.tp_expected:
                     self.close_all_positions(symbol)
                     self.cancel_all_pending_orders(symbol)
+                    
                     current_balance = self.get_current_balance()
                     total_pnl = current_balance - start_balance
                     run_time = datetime.now() - script_start_time
                     run_time_str = str(run_time).split('.')[0]
+                    
                     msg = (
                         f"✅✅✅✅✅ Target profit reached.\n"
                         f"Start balance: {start_balance}\n"
@@ -1323,9 +1327,11 @@ class GridDCAStrategy:
                         f"Session PnL: {closed_pnl + open_pnl}\n"
                         f"Run time: {run_time_str}"
                     )
+                    
                     self.logger.info(msg)
                     if self.telegram_bot:
                         self.telegram_bot.send_message(msg, chat_id=self.telegram_chat_id, pin_msg=True, disable_notification=False)
+                    
                     # Reset state
                     self.detail_orders = {key: {'status': None} for key in self.detail_orders.keys()}
                     self.notified_filled.clear()
@@ -1333,6 +1339,7 @@ class GridDCAStrategy:
                     self.current_idx = 0
                     closed_pnl = 0
                     self.max_drawdown = 0
+                    
                     # Check if stop was requested
                     if self.stop_requested:
                         self.bot_paused = True
@@ -1347,6 +1354,7 @@ class GridDCAStrategy:
                             self.telegram_bot.send_message(pause_msg, chat_id=self.telegram_chat_id, pin_msg=True, disable_notification=False)
                         self.logger.info("Bot paused after reaching target profit (stop requested)")
                         continue
+                    
                     # Apply override or quiet hours
                     if self.next_trade_amount is not None:
                         old_amount = self.trade_amount
@@ -1380,6 +1388,7 @@ class GridDCAStrategy:
                             trade_amount = self.trade_amount
                             self.tp_expected = trade_amount * 1000
                             self.logger.info(f"🕰️ Normal trade amount: {trade_amount} (GMT+7: {current_hour}:00)")
+                    
                     # Check for remaining positions/orders
                     positions_left = self.mt5.get_positions()
                     open_orders_left = self.mt5_api.orders_get(symbol=symbol)
@@ -1392,25 +1401,26 @@ class GridDCAStrategy:
                         self.logger.warning(f"⚠️ Open orders remain after TP: {open_orders_left}")
                         if self.telegram_bot:
                             self.telegram_bot.send_message(f"⚠️ Open orders remain after TP: {open_orders_left}", chat_id=self.telegram_chat_id)
+                    
                     script_start_time = datetime.now()
                     self.session_start_time = script_start_time
                     start_balance = self.get_current_balance()
                     self.start_balance = start_balance
-                    # Calculate max reduce threshold
-                    if self.max_reduce_enabled:
-                        self.max_reduce_threshold_equity = self.start_balance - self.max_reduce_balance
-                        self.logger.info(f"Max reduce protection reset: threshold={self.max_reduce_threshold_equity:.2f}, max_reduce={self.max_reduce_balance}")
-                        self.max_reduce_triggered = False  # Reset on new cycle
                     self.run_at_index(symbol, trade_amount, self.current_idx, price=0)
+                
                 # # Periodic balance/equity logging (every 1 minute)
                 # if self.should_log_balance():
                 #     self.log_balance_equity()
+                
                 time.sleep(0.2)
+        
         except KeyboardInterrupt:
             self.logger.info("Interrupted by user. Disconnecting...")
         except Exception as e:
             self.logger.error(f"Error in strategy run: {e}")
+        
         self.mt5.disconnect()
+    
     def handle_telegram_command(self):
         """
         Handle incoming Telegram commands and update strategy state.
@@ -1418,18 +1428,23 @@ class GridDCAStrategy:
         """
         if not self.telegram_bot:
             return
+        
         try:
             # Get updates from Telegram with offset to avoid processing same updates
             offset = self.last_telegram_update_id + 1 if self.last_telegram_update_id else None
             updates = self.telegram_bot.bot.get_updates(timeout=1, offset=offset)
+            
             for update in updates:
                 # Update the last processed update_id
                 if update.update_id:
                     self.last_telegram_update_id = update.update_id
+                
                 if update.message and update.message.text:
                     chat_id = update.message.chat.id
                     text = update.message.text.strip()
+                    
                     self.logger.info(f"Received Telegram command: {text} from chat_id: {chat_id}")
+                    
                     # Handle /start command
                     if text == '/start':
                         account_number = "N/A"
@@ -1439,34 +1454,138 @@ class GridDCAStrategy:
                                 account_number = acc_info.login
                         except Exception as e:
                             self.logger.debug(f"Could not get account info: {e}")
+                        
                         if self.bot_paused:
+                            # Check if emergency stop was triggered
+                            if self.equity_emergency_triggered:
+                                emergency_msg = (
+                                    f"🚨 <b>CANNOT RESTART - EQUITY EMERGENCY</b> 🚨\n\n"
+                                    f"┌─────────────────────────────┐\n"
+                                    f"│   ❌ <b>RESTART BLOCKED</b>      │\n"
+                                    f"└─────────────────────────────┘\n\n"
+                                    f"🚫 Bot cannot restart - equity threshold breached!\n\n"
+                                    f"💰 <b>Account Status:</b>\n"
+                                    f"┣━ ⚠️ Minimum Required: <code>${self.min_equity_threshold:.2f}</code>\n"
+                                    f"┗━ 💎 Current Equity: <code>${self.get_current_equity():.2f}</code>\n\n"
+                                    f"🔧 <b>Recovery Process:</b>\n"
+                                    f"┣━ 1️⃣ Ensure equity > <code>${self.min_equity_threshold:.2f}</code>\n"
+                                    f"┣━ 2️⃣ Use <code>/resetequity</code> to clear emergency\n"
+                                    f"┗━ 3️⃣ Use <code>/start</code> to resume trading\n\n"
+                                    f"⚠️ <i>Manual account review recommended!</i>"
+                                )
+                                self.telegram_bot.send_message(emergency_msg, chat_id=chat_id, disable_notification=False)
+                                return
+                            
+                            # Check if minimum equity threshold is set (FTMO requirement)
+                            if self.equity_threshold_required and self.min_equity_threshold is None:
+                                required_msg = (
+                                    f"🏛️ <b>PROP FIRM SETUP REQUIRED</b>\n\n"
+                                    f"⚠️ <b>Cannot start trading without equity protection!</b>\n\n"
+                                    f"🛡️ <b>Required Setup:</b>\n"
+                                    f"You must set a minimum equity threshold before trading.\n\n"
+                                    f"💰 <b>Current Account:</b>\n"
+                                    f"• Current Equity: ${self.get_current_equity():.2f}\n\n"
+                                    f"🔧 <b>Setup Steps:</b>\n"
+                                    f"1. Use: /setminequity AMOUNT\n"
+                                    f"2. Example: /setminequity 9600\n"
+                                    f"3. Then use: /start to begin trading\n\n"
+                                    f"ℹ️ <b>Recommended thresholds:</b>\n"
+                                    f"• $10k account: /setminequity 9600\n"
+                                    f"• $25k account: /setminequity 24000\n"
+                                    f"• $50k account: /setminequity 48000\n"
+                                    f"• $100k account: /setminequity 96000"
+                                )
+                                self.telegram_bot.send_message(required_msg, chat_id=chat_id, disable_notification=False)
+                                return
+                            
+                            # Check if minimum equity threshold is set (FTMO requirement)
+                            if self.equity_threshold_required and self.min_equity_threshold is None:
+                                required_msg = (
+                                    f"🏛️ <b>PROP FIRM SETUP REQUIRED</b>\n\n"
+                                    f"⚠️ <b>Cannot start trading without equity protection!</b>\n\n"
+                                    f"🛡️ <b>Required Setup:</b>\n"
+                                    f"You must set a minimum equity threshold before trading.\n\n"
+                                    f"💰 <b>Current Account:</b>\n"
+                                    f"• Current Equity: ${self.get_current_equity():.2f}\n\n"
+                                    f"🔧 <b>Setup Steps:</b>\n"
+                                    f"1. Use: /setminequity AMOUNT\n"
+                                    f"2. Example: /setminequity 9600\n"
+                                    f"3. Then use: /start to begin trading\n\n"
+                                    f"ℹ️ <b>Recommended thresholds:</b>\n"
+                                    f"• $10k account: /setminequity 9600\n"
+                                    f"• $25k account: /setminequity 24000\n"
+                                    f"• $50k account: /setminequity 48000\n"
+                                    f"• $100k account: /setminequity 96000"
+                                )
+                                self.telegram_bot.send_message(required_msg, chat_id=chat_id, disable_notification=False)
+                                return
+                            
                             self.bot_paused = False
                             self.stop_requested = False
-                            # Reset max reduce protection if it was triggered
-                            was_max_reduce_triggered = self.max_reduce_triggered
-                            if self.max_reduce_triggered:
-                                self.max_reduce_triggered = False
-                                new_balance = self.get_current_balance()
-                                self.start_balance = new_balance
-                                if self.max_reduce_enabled:
-                                    self.max_reduce_threshold_equity = self.start_balance - self.max_reduce_balance
-                                    self.logger.info(f"Max reduce protection reset: new start balance={self.start_balance:.2f}, threshold={self.max_reduce_threshold_equity:.2f}")
-                            resume_msg = f"▶️ <b>Bot Resumed!</b>\n\n"
-                            resume_msg += f"• Account: {account_number}\n"
-                            resume_msg += f"• Symbol: {self.trade_symbol}\n"
-                            resume_msg += f"• Trade Amount: {self.trade_amount}\n"
-                            resume_msg += f"• Status: Running ✅\n\n"
-                            if was_max_reduce_triggered:
-                                resume_msg += f"🛡️ Max reduce protection reset with new start balance: ${self.start_balance:.2f}\n\n"
-                            resume_msg += f"The bot will now resume trading operations."
-                            self.telegram_bot.send_message(resume_msg, chat_id=chat_id, disable_notification=False)
-                            self.logger.info(f"Bot resumed by user command from chat_id: {chat_id}")
+                            
+                            # Check if this is the first start (initial grid placement needed)
+                            if not self.user_started:
+                                self.user_started = True
+                                current_equity = self.get_current_equity()
+                                welcome_msg = (
+                                    f"🏛️ <b>FTMO STRATEGY ACTIVATED</b> 🏛️\n\n"
+                                    f"┌─────────────────────────────┐\n"
+                                    f"│      🚀 <b>TRADING COMMENCED</b>      │\n"
+                                    f"└─────────────────────────────┘\n\n"
+                                    f"📊 <b>Account Overview:</b>\n"
+                                    f"┣━ 🟢 Status: <b>Active & Ready</b>\n"
+                                    f"┣━ 💰 Current Equity: <code>${current_equity:.2f}</code>\n"
+                                    f"┗━ ⚙️ Magic Number: <code>{self.magic_number}</code>\n\n"
+                                    f"🛡️ <b>Protection Status:</b>\n"
+                                )
+                                
+                                if self.min_equity_threshold:
+                                    welcome_msg += (
+                                        f"┣━ ✅ Equity Guard: <code>${self.min_equity_threshold:.2f}</code>\n"
+                                        f"┗━ 🟢 Emergency Stop: <b>Configured</b>\n\n"
+                                    )
+                                else:
+                                    welcome_msg += (
+                                        f"┣━ ⚠️ No equity protection set!\n"
+                                        f"┣━ 📝 Recommend: <code>/setminequity 9600</code>\n"
+                                        f"┗━ 🔴 <b>High risk for prop accounts!</b>\n\n"
+                                    )
+                                
+                                welcome_msg += (
+                                    f"🎯 <b>Next Actions:</b>\n"
+                                    f"┣━ ⚡ Initial grid placement starting...\n"
+                                    f"┗━ 📱 Use <code>/status</code> to monitor progress\n\n"
+                                    f"<i>🤖 Bot is now actively monitoring the market</i>"
+                                )
+                                self.telegram_bot.send_message(welcome_msg, chat_id=chat_id, disable_notification=False)
+                                self.logger.info(f"FTMO Bot started by user command from chat_id: {chat_id}")
+                                
+                                # Place initial grid now that user has started the bot
+                                try:
+                                    symbol = self.trade_symbol
+                                    trade_amount = self.trade_amount
+                                    self.run_at_index(symbol, trade_amount, index=self.current_idx, price=0)
+                                    self.logger.info("Initial grid placement completed after user start command")
+                                except Exception as e:
+                                    self.logger.error(f"Error placing initial grid after start: {e}")
+                                    if self.telegram_bot:
+                                        self.telegram_bot.send_message(f"⚠️ Error placing initial grid: {e}", chat_id=chat_id)
+                            else:
+                                # Regular resume
+                                resume_msg = f"▶️ <b>Bot Resumed!</b>\n\n"
+                                resume_msg += f"• Account: {account_number}\n"
+                                resume_msg += f"• Symbol: {self.trade_symbol}\n"
+                                resume_msg += f"• Trade Amount: {self.trade_amount}\n"
+                                resume_msg += f"• Status: Running ✅\n\n"
+                                resume_msg += f"The bot will now resume trading operations."
+                                self.telegram_bot.send_message(resume_msg, chat_id=chat_id, disable_notification=False)
+                                self.logger.info(f"Bot resumed by user command from chat_id: {chat_id}")
                         else:
                             welcome_msg = f"👋 <b>Hello!</b>\n\n"
                             welcome_msg += f"• Account: {account_number}\n\n"
                             welcome_msg += f"Welcome to the Grid DCA Trading Bot for {self.trade_symbol}!\n\n"
                             welcome_msg += f"<b>Bot Status:</b>\n"
-                            welcome_msg += f"• Strategy: Grid DCA\n"
+                            welcome_msg += f"• Strategy: Grid DCA (FTMO Mode)\n"
                             welcome_msg += f"• Symbol: {self.trade_symbol}\n"
                             welcome_msg += f"• Trade Amount: {self.trade_amount}\n"
                             welcome_msg += f"• Status: Running ✅\n\n"
@@ -1481,6 +1600,7 @@ class GridDCAStrategy:
                             welcome_msg += f"• /setamount X.XX - Set trade amount for next run\n"
                             self.telegram_bot.send_message(welcome_msg, chat_id=chat_id, disable_notification=False)
                             self.logger.info(f"Sent welcome message to chat_id: {chat_id}")
+                    
                     # Handle /stop command
                     elif text == '/stop':
                         if not self.stop_requested:
@@ -1496,6 +1616,7 @@ class GridDCAStrategy:
                         else:
                             already_stopped_msg = f"⏸️ Stop already requested. Bot will pause after next TP."
                             self.telegram_bot.send_message(already_stopped_msg, chat_id=chat_id, disable_notification=False)
+                    
                     # Handle /setamount command
                     elif text.startswith('/setamount'):
                         try:
@@ -1526,6 +1647,7 @@ class GridDCAStrategy:
                             error_msg = f"❌ Error setting trade amount: {str(e)}"
                             self.telegram_bot.send_message(error_msg, chat_id=chat_id, disable_notification=False)
                             self.logger.error(f"Error in /setamount command: {e}")
+                    
                     # Handle /status command
                     elif text == '/status':
                         try:
@@ -1534,6 +1656,7 @@ class GridDCAStrategy:
                             balance = getattr(acc_info, 'balance', 0.0) if acc_info else 0.0
                             equity = getattr(acc_info, 'equity', 0.0) if acc_info else 0.0
                             free_margin = getattr(acc_info, 'margin_free', 0.0) if acc_info else 0.0
+
                             open_positions = self.mt5_api.positions_get(symbol=self.trade_symbol)
                             pos_count = 0
                             open_pnl = 0.0
@@ -1541,13 +1664,26 @@ class GridDCAStrategy:
                                 if getattr(p, 'magic', None) == self.magic_number:
                                     pos_count += 1
                                     open_pnl += float(getattr(p, 'profit', 0.0))
+
                             pending_orders = self.mt5_api.orders_get(symbol=self.trade_symbol)
                             order_count = 0
                             for o in pending_orders or []:
                                 if getattr(o, 'magic', None) == self.magic_number:
                                     order_count += 1
-                            status_str = 'Paused ⏸️' if self.bot_paused else ('Stopping after TP ⏳' if self.stop_requested else 'Running ✅')
+
+                            if self.bot_paused:
+                                if self.equity_emergency_triggered:
+                                    status_str = 'STOPPED (Equity Emergency) 🚨⏹️'
+                                elif self.equity_threshold_required and self.min_equity_threshold is None:
+                                    status_str = 'Paused (Equity Setup Required) 🏛️⏸️'
+                                elif not self.user_started:
+                                    status_str = 'Paused (Awaiting Start) 🔶⏸️'
+                                else:
+                                    status_str = 'Paused ⏸️'
+                            else:
+                                status_str = 'Stopping after TP ⏳' if self.stop_requested else 'Running ✅'
                             next_amount_str = f"{self.next_trade_amount}" if self.next_trade_amount else '-'
+                            
                             run_time_str = '-'
                             try:
                                 if self.session_start_time:
@@ -1555,75 +1691,56 @@ class GridDCAStrategy:
                                     run_time_str = str(run_time).split('.')[0]
                             except Exception:
                                 pass
-                            msg = f"🤖 <b>Bot Status</b>\n\n"
-                            msg += f"• Account: {login}\n"
-                            msg += f"• Symbol: {self.trade_symbol}\n"
-                            msg += f"• Status: {status_str}\n"
+
+                            msg = f"🏛️ <b>FTMO STRATEGY DASHBOARD</b> 🏛️\n\n"
+                            msg += f"┌─────────────────────────────┐\n"
+                            msg += f"│        📊 <b>LIVE STATUS</b>        │\n"
+                            msg += f"└─────────────────────────────┘\n\n"
+                            msg += f"🎛️ <b>Bot Configuration:</b>\n"
+                            msg += f"┣━ 🏛️ Account: <code>{login}</code>\n"
+                            msg += f"┣━ 📈 Symbol: <code>{self.trade_symbol}</code>\n"
+                            msg += f"┣━ ⚡ Status: <b>{status_str}</b>\n"
                             try:
                                 if self.stop_at_datetime:
-                                    msg += f"• Stop at: {self.stop_at_datetime.strftime('%Y-%m-%d %H:%M')} GMT+7\n"
+                                    msg += f"┣━ ⏰ Scheduled Stop: <code>{self.stop_at_datetime.strftime('%Y-%m-%d %H:%M')} GMT+7</code>\n"
                             except Exception:
                                 pass
-                            msg += f"• Current Index: {self.current_idx}\n"
-                            msg += f"• Target Profit Threshold: ${self.tp_expected:.2f}\n\n"
-                            msg += f"<b>Session</b>\n"
-                            msg += f"• Run time: {run_time_str}\n\n"
-                            msg += f"<b>Account</b>\n"
-                            msg += f"• Balance: ${balance:.2f}\n"
-                            msg += f"• Equity: ${equity:.2f}\n"
-                            msg += f"• Free Margin: ${free_margin:.2f}\n\n"
-                            msg += f"<b>Positions & Orders</b>\n"
-                            msg += f"• Open positions: {pos_count}\n"
-                            msg += f"• Pending orders: {order_count}\n"
-                            msg += f"• Open PnL (strategy): ${open_pnl:.2f}\n\n"
-                            msg += f"<b>Trade Amount</b>\n"
-                            msg += f"• Configured amount: {self.trade_amount}\n"
-                            msg += f"• Next run override: {next_amount_str}\n\n"
-                            msg += f"<b>Guards</b>\n"
+                            msg += f"┣━ 📊 Current Index: <code>{self.current_idx}</code>\n"
+                            msg += f"┗━ 🎯 TP Threshold: <code>${self.tp_expected:.2f}</code>\n\n"
+                            msg += f"⏱️ <b>Session Info:</b>\n"
+                            msg += f"┗━ 🕐 Runtime: <code>{run_time_str}</code>\n\n"
+                            msg += f"💰 <b>Account Summary:</b>\n"
+                            msg += f"┣━ 💵 Balance: <code>${balance:.2f}</code>\n"
+                            msg += f"┣━ 💎 Equity: <code>${equity:.2f}</code>\n"
+                            msg += f"┗━ 💳 Free Margin: <code>${free_margin:.2f}</code>\n\n"
+                            msg += f"📊 <b>Trading Activity:</b>\n"
+                            msg += f"┣━ 📍 Open Positions: <code>{pos_count}</code>\n"
+                            msg += f"┣━ ⏳ Pending Orders: <code>{order_count}</code>\n"
+                            msg += f"┗━ 💹 Strategy P&L: <code>${open_pnl:.2f}</code>\n\n"
+                            msg += f"🎯 <b>Trade Configuration:</b>\n"
+                            msg += f"┣━ 📊 Base Amount: <code>{self.trade_amount}</code>\n"
+                            msg += f"┗━ 🔄 Next Override: <code>{next_amount_str}</code>\n\n"
+                            msg += f"🛡️ <b>Risk Management:</b>\n"
                             try:
-                                qh_state = 'on' if self.quiet_hours_enabled else 'off'
-                                msg += f"• Quiet hours: {qh_state} ({self.quiet_hours_start:02d}-{self.quiet_hours_end:02d} x{self.quiet_hours_factor})\n"
-                                # Enhanced blackout status with current state
-                                if self.blackout_enabled:
-                                    gmt_plus_7 = timezone(timedelta(hours=7))
-                                    now_gmt7 = datetime.now(gmt_plus_7)
-                                    current_hour = now_gmt7.hour
-                                    currently_in_blackout = (
-                                        (self.blackout_start <= self.blackout_end and self.blackout_start <= current_hour < self.blackout_end) or
-                                        (self.blackout_start > self.blackout_end and (current_hour >= self.blackout_start or current_hour < self.blackout_end))
-                                    )
-                                    if currently_in_blackout:
-                                        if current_hour < self.blackout_end or (self.blackout_start > self.blackout_end and current_hour < self.blackout_end):
-                                            hours_left = (self.blackout_end - current_hour) if current_hour < self.blackout_end else (24 - current_hour + self.blackout_end)
-                                        else:
-                                            hours_left = self.blackout_end - current_hour
-                                        msg += f"• Blackout: 🔴 ACTIVE ({self.blackout_start:02d}:00-{self.blackout_end:02d}:00) - {hours_left}h left\n"
-                                    else:
-                                        if current_hour < self.blackout_start:
-                                            hours_until = self.blackout_start - current_hour
-                                        else:
-                                            hours_until = 24 - current_hour + self.blackout_start
-                                        msg += f"• Blackout: 🟢 inactive ({self.blackout_start:02d}:00-{self.blackout_end:02d}:00) - starts in {hours_until}h\n"
+                                qh_icon = "🟢" if self.quiet_hours_enabled else "⚪"
+                                bl_icon = "🟢" if self.blackout_enabled else "⚪"
+                                halt_icon = "🟢" if self.trading_halt_enabled else "⚪"
+                                halt_status = "🛑 ACTIVE" if self.trading_halt_active else "⚪ Inactive"
+                                msg += f"┣━ 🕰️ Quiet Hours: {qh_icon} ({self.quiet_hours_start:02d}-{self.quiet_hours_end:02d} x{self.quiet_hours_factor})\n"
+                                msg += f"┣━ ⛔ Blackout: {bl_icon} ({self.blackout_start:02d}-{self.blackout_end:02d})\n"
+                                msg += f"┣━ 🛑 Trading Halt: {halt_icon} (04:00-06:30) - {halt_status}\n"
+                                msg += f"┣━ 🎛️ Limits: DD={self.max_dd_threshold} | Pos={self.max_positions} | Orders={self.max_orders} | Spread={self.max_spread}\n"
+                                msg += f"┣━ 💼 Max Reduce: <code>${self.max_reduce_balance:.2f}</code>\n"
+                                if self.min_equity_threshold:
+                                    emergency_icon = "🚨" if self.equity_emergency_triggered else "🟢"
+                                    msg += f"┗━ 🏛️ Prop Protection: <code>${self.min_equity_threshold:.2f}</code> ({emergency_icon})\n"
+                                elif self.equity_threshold_required:
+                                    msg += f"┗━ 🏛️ Prop Protection: 🔴 <b>NOT SET (Required!)</b>\n"
                                 else:
-                                    msg += f"• Blackout: disabled\n"
-                                msg += f"• Caps: maxDD={self.max_dd_threshold}, maxPos={self.max_positions}, maxOrders={self.max_orders}, maxSpread={self.max_spread}\n"
-                                # Max reduce protection status
-                                if self.max_reduce_enabled:
-                                    current_equity = self.get_current_equity()  # Use equity for accurate drawdown
-                                    current_drawdown = self.start_balance - current_equity
-                                    remaining_buffer = current_equity - self.max_reduce_threshold_equity if self.max_reduce_threshold_equity else 0
-                                    if self.max_reduce_triggered:
-                                        msg += f"• Max reduce: 🚨 EMERGENCY STOP TRIGGERED (limit: ${self.max_reduce_balance:.2f})\n"
-                                    elif remaining_buffer <= 0:
-                                        msg += f"• Max reduce: ⚠️ AT THRESHOLD (limit: ${self.max_reduce_balance:.2f}, drawdown: ${current_drawdown:.2f})\n"
-                                    elif remaining_buffer < 100:
-                                        msg += f"• Max reduce: 🟡 NEAR LIMIT (limit: ${self.max_reduce_balance:.2f}, buffer: ${remaining_buffer:.2f})\n"
-                                    else:
-                                        msg += f"• Max reduce: 🛡️ PROTECTED (limit: ${self.max_reduce_balance:.2f}, buffer: ${remaining_buffer:.2f})\n"
-                                else:
-                                    msg += f"• Max reduce: disabled\n"
+                                    msg += f"┗━ 🏛️ Prop Protection: ⚪ Disabled\n"
                             except Exception:
                                 pass
+                            
                             msg += f"\n<b>Pattern Detection</b>\n"
                             try:
                                 pd = self.check_consecutive_orders_pattern()
@@ -1634,54 +1751,67 @@ class GridDCAStrategy:
                                 msg += f"• Total filled orders: {pd.get('total_filled', 0)}\n"
                             except Exception as e_pattern:
                                 msg += f"• Pattern check error: {str(e_pattern)[:50]}\n"
+
                             self.telegram_bot.send_message(msg, chat_id=chat_id, disable_notification=False)
                         except Exception as e:
                             self.logger.error(f"Error building /status: {e}")
                             self.telegram_bot.send_message("❌ Failed to get status.", chat_id=chat_id, disable_notification=False)
+
                     # Handle /help command
                     elif text == '/help':
                         try:
                             help_msg = (
-                                "📖 <b>Available Commands</b>\n\n"
-                                "<b>Control</b>\n"
-                                "• /start — Resume bot (if paused)\n"
-                                "• /resume — Alias of /start\n"
-                                "• /pause — Pause immediately (no new grids)\n"
-                                "• /stop — Finish current cycle, pause after TP\n"
-                                "• /stopat HH:MM — Schedule pause at time (GMT+7)\n"
-                                "• /panic — Emergency stop (requires '/panic confirm')\n\n"
-                                "<b>Configuration</b>\n"
-                                "• /setamount X.XX — Set persistent override (applies after next TP)\n"
-                                "• /clearamount — Remove persistent override\n"
-                                "• /quiethours — Show or set quiet-hours window and factor\n\n"
-                                "• /setmaxdd X — Auto-pause if drawdown exceeds X\n"
-                                "• /setmaxpos N — Cap concurrent positions\n"
-                                "• /setmaxorders N — Cap concurrent pending orders\n"
-                                "• /setspread X — Max allowed spread\n"
-                                "• /setmaxreducebalance X — Max equity reduction allowed\n"
-                                "• /blackout — Show blackout status or set 2am-6am risk window\n\n"
-                                "<b>Insights</b>\n"
-                                "• /status — Bot and account status\n"
-                                "• /drawdown — Show drawdown report\n\n"
-                                "• /history N — Last N deals\n"
-                                "• /pnl today|week|month — Aggregated PnL\n"
-                                "• /filled — Show filled orders summary\n"
-                                "• /pattern — Show consecutive filled-order pattern\n"
-                                "• /balance [hours] — Generate balance/equity chart\n"
-                                "• /balancelog — Show balance/equity log file info\n\n"
-                                "<b>Examples</b>\n"
-                                "• /setamount 0.05\n"
-                                "• /stopat 21:00\n"
-                                "• /setmaxdd 300\n"
-                                "• /setspread 0.30\n"
-                                "• /setmaxreducebalance 5000\n"
-                                "• /balance 12\n"
-                                "• /panic confirm\n"
+                                "🏛️ <b>FTMO STRATEGY COMMANDS</b> 🏛️\n\n"
+                                "┌─────────────────────────────┐\n"
+                                "│       📖 <b>COMMAND GUIDE</b>       │\n"
+                                "└─────────────────────────────┘\n\n"
+                                "🎮 <b>Bot Control:</b>\n"
+                                "┣━ 🚀 /start — Start trading or resume\n"
+                                "┣━ ▶️ /resume — Alias of /start\n"
+                                "┣━ ⏸️ /pause — Pause immediately\n"
+                                "┣━ ⏹️ /stop — Finish cycle, then pause\n"
+                                "┣━ ⏰ /stopat HH:MM — Schedule pause\n"
+                                "┗━ 🆘 /panic — Emergency stop\n\n"
+                                "⚙️ <b>Configuration:</b>\n"
+                                "┣━ 💰 /setamount X.XX — Override trade amount\n"
+                                "┣━ 🧹 /clearamount — Remove override\n"
+                                "┣━ 🕰️ /quiethours — Set quiet window\n"
+                                "┣━ 🛑 /tradinghalt — Control news protection\n"
+                                "┣━ 📉 /setmaxdd X — Set max drawdown\n"
+                                "┣━ 📊 /setmaxpos N — Cap positions\n"
+                                "┣━ 📋 /setmaxorders N — Cap orders\n"
+                                "┣━ 📏 /setspread X — Max spread\n"
+                                "┣━ 💼 /setmaxreducebalance X — Equity limit\n"
+                                "┗━ ⛔ /blackout — Set blackout window\n\n"
+                                "🏛️ <b>Prop Firm Protection:</b>\n"
+                                "┣━ 🛡️ /setminequity X — Set equity guard\n"
+                                "┗━ 🔄 /resetequity — Reset emergency\n\n"
+                                "📊 <b>Analytics & Status:</b>\n"
+                                "┣━ 📱 /status — Full bot status\n"
+                                "┣━ 📉 /drawdown — Drawdown report\n"
+                                "┣━ 📚 /history N — Recent deals\n"
+                                "┣━ 💹 /pnl — P&L summary\n"
+                                "┣━ ✅ /filled — Filled orders\n"
+                                "┣━ 🧩 /pattern — Pattern analysis\n"
+                                "┣━ 📈 /balance — Equity chart\n"
+                                "┗━ 📄 /balancelog — Log info\n\n"
+                                "💡 <b>Quick Examples:</b>\n"
+                                "┣━ 💰 <code>/setamount 0.05</code>\n"
+                                "┣━ ⏰ <code>/stopat 21:00</code>\n"
+                                "┣━ 🛑 <code>/tradinghalt on</code>\n"
+                                "┣━ 📉 <code>/setmaxdd 300</code>\n"
+                                "┣━ 📏 <code>/setspread 0.30</code>\n"
+                                "┣━ 💼 <code>/setmaxreducebalance 5000</code>\n"
+                                "┣━ 🛡️ <code>/setminequity 9600</code>\n"
+                                "┣━ 📈 <code>/balance 12</code>\n"
+                                "┗━ 🆘 <code>/panic confirm</code>\n\n"
+                                "<i>🏛️ Professional trading for prop firm accounts</i>"
                             )
                             self.telegram_bot.send_message(help_msg, chat_id=chat_id, disable_notification=False)
                         except Exception as e:
                             self.logger.error(f"Error building /help: {e}")
                             self.telegram_bot.send_message("❌ Failed to build help.", chat_id=chat_id, disable_notification=False)
+
                     # Handle /pause command
                     elif text == '/pause':
                         try:
@@ -1698,6 +1828,7 @@ class GridDCAStrategy:
                                 self.telegram_bot.send_message("⏸️ Bot is already paused.", chat_id=chat_id, disable_notification=False)
                         except Exception as e:
                             self.logger.error(f"Error handling /pause: {e}")
+
                     # Handle /panic command (requires confirmation)
                     elif text.startswith('/panic'):
                         try:
@@ -1708,6 +1839,7 @@ class GridDCAStrategy:
                                 self.stop_requested = False
                                 self.detail_orders.clear()
                                 self.notified_filled.clear()
+                                
                                 self.telegram_bot.send_message(
                                     "🛑 <b>PANIC STOP executed</b>\n\nAll strategy positions closed, pending orders cancelled, and bot paused. Send /start or /resume to continue.",
                                     chat_id=chat_id,
@@ -1723,6 +1855,7 @@ class GridDCAStrategy:
                                 )
                         except Exception as e:
                             self.logger.error(f"Error handling /panic: {e}")
+
                     # Handle /resume command (alias of /start)
                     elif text == '/resume':
                         try:
@@ -1750,12 +1883,14 @@ class GridDCAStrategy:
                                 self.telegram_bot.send_message("▶️ Bot is already running.", chat_id=chat_id, disable_notification=False)
                         except Exception as e:
                             self.logger.error(f"Error handling /resume: {e}")
+
                     # Handle /drawdown command
                     elif text == '/drawdown':
                         try:
                             self.telegram_bot.send_message(self.drawdown_report(), chat_id=chat_id, disable_notification=False)
                         except Exception as e:
                             self.logger.error(f"Error handling /drawdown: {e}")
+
                     # Handle /clearamount command
                     elif text.strip().lower() == '/clearamount':
                         try:
@@ -1774,6 +1909,7 @@ class GridDCAStrategy:
                         except Exception as e:
                             self.logger.error(f"Error handling /clearamount: {e}")
                             self.telegram_bot.send_message("❌ Failed to clear override.", chat_id=chat_id, disable_notification=False)
+
                     # Handle /stopat HH:MM (GMT+7) or /stopat off
                     elif text.startswith('/stopat'):
                         try:
@@ -1802,6 +1938,7 @@ class GridDCAStrategy:
                         except Exception as e:
                             self.logger.error(f"Error handling /stopat: {e}")
                             self.telegram_bot.send_message("❌ Failed to schedule pause.", chat_id=chat_id, disable_notification=False)
+
                     # Handle risk caps
                     elif text.startswith('/setmaxdd'):
                         try:
@@ -1814,6 +1951,7 @@ class GridDCAStrategy:
                         except Exception as e:
                             self.logger.error(f"Error handling /setmaxdd: {e}")
                             self.telegram_bot.send_message("❌ Failed to set max drawdown.", chat_id=chat_id, disable_notification=False)
+
                     elif text.startswith('/setmaxpos'):
                         try:
                             parts = text.split()
@@ -1825,6 +1963,7 @@ class GridDCAStrategy:
                         except Exception as e:
                             self.logger.error(f"Error handling /setmaxpos: {e}")
                             self.telegram_bot.send_message("❌ Failed to set max positions.", chat_id=chat_id, disable_notification=False)
+
                     elif text.startswith('/setmaxorders'):
                         try:
                             parts = text.split()
@@ -1836,6 +1975,7 @@ class GridDCAStrategy:
                         except Exception as e:
                             self.logger.error(f"Error handling /setmaxorders: {e}")
                             self.telegram_bot.send_message("❌ Failed to set max pending orders.", chat_id=chat_id, disable_notification=False)
+
                     elif text.startswith('/setspread'):
                         try:
                             parts = text.split()
@@ -1847,6 +1987,7 @@ class GridDCAStrategy:
                         except Exception as e:
                             self.logger.error(f"Error handling /setspread: {e}")
                             self.telegram_bot.send_message("❌ Failed to set max spread.", chat_id=chat_id, disable_notification=False)
+
                     elif text.startswith('/setmaxreducebalance'):
                         try:
                             parts = text.split()
@@ -1865,150 +2006,181 @@ class GridDCAStrategy:
                         except Exception as e:
                             self.logger.error(f"Error handling /setmaxreducebalance: {e}")
                             self.telegram_bot.send_message("❌ Failed to set max reduce balance.", chat_id=chat_id, disable_notification=False)
+                    
+                    # Handle /setminequity command (prop firm protection)
+                    elif text.startswith('/setminequity'):
+                        try:
+                            parts = text.split()
+                            if len(parts) == 2:
+                                new_threshold = float(parts[1])
+                                if new_threshold > 0:
+                                    old_threshold = self.min_equity_threshold
+                                    self.min_equity_threshold = new_threshold
+                                    self.equity_threshold_required = False  # Mark as configured
+                                    current_equity = self.get_current_equity()
+                                    success_msg = (
+                                        f"🏛️ <b>PROP FIRM PROTECTION SET</b> 🏛️\n\n"
+                                        f"┌─────────────────────────────┐\n"
+                                        f"│    ✅ <b>EQUITY GUARD ACTIVE</b>     │\n"
+                                        f"└─────────────────────────────┘\n\n"
+                                        f"📊 <b>Configuration Update:</b>\n"
+                                        f"┣━ 📉 Previous: <code>{'${:.2f}'.format(old_threshold) if old_threshold else 'Not set'}</code>\n"
+                                        f"┣━ 📈 New Threshold: <code>${new_threshold:.2f}</code>\n"
+                                        f"┗━ 💰 Current Equity: <code>${current_equity:.2f}</code>\n\n"
+                                        f"🚨 <b>Emergency Protection Details:</b>\n"
+                                        f"┣━ ⚠️ Trigger Level: <code>${new_threshold:.2f}</code>\n"
+                                        f"┣━ 🔒 Auto-close ALL positions\n"
+                                        f"┣━ 🗑️ Cancel ALL pending orders\n"
+                                        f"┗━ ⏹️ STOP strategy permanently\n\n"
+                                        f"✅ <b>Status: Ready for Trading!</b>\n"
+                                        f"🚀 Use <code>/start</code> if bot is paused\n\n"
+                                        f"<i>🛡️ Your prop firm account is now protected!</i>"
+                                    )
+                                    self.telegram_bot.send_message(success_msg, chat_id=chat_id, disable_notification=False)
+                                    self.logger.info(f"Prop firm equity protection set to ${new_threshold:.2f}")
+                                    
+                                    # Immediate check if current equity is already below threshold
+                                    if current_equity <= new_threshold:
+                                        warning_msg = (
+                                            f"⚠️ <b>WARNING: Current equity already below threshold!</b>\n\n"
+                                            f"• Current: ${current_equity:.2f}\n"
+                                            f"• Threshold: ${new_threshold:.2f}\n\n"
+                                            f"Emergency stop will trigger immediately when trading resumes."
+                                        )
+                                        self.telegram_bot.send_message(warning_msg, chat_id=chat_id, disable_notification=False)
+                                else:
+                                    error_msg = "❌ Threshold must be greater than 0.\nExample: /setminequity 9600"
+                                    self.telegram_bot.send_message(error_msg, chat_id=chat_id, disable_notification=False)
+                            else:
+                                help_msg = (
+                                    f"🏛️ <b>Set Minimum Equity Threshold</b>\n\n"
+                                    f"Usage: /setminequity AMOUNT\n"
+                                    f"Emergency stop when equity drops to this level.\n\n"
+                                    f"Examples:\n"
+                                    f"• /setminequity 9600 (stop at $9,600)\n"
+                                    f"• /setminequity 4800 (stop at $4,800)\n\n"
+                                    f"Current threshold: ${self.min_equity_threshold:.2f}" if self.min_equity_threshold else "Current threshold: Not set\n"
+                                    f"Current equity: ${self.get_current_equity():.2f}"
+                                )
+                                self.telegram_bot.send_message(help_msg, chat_id=chat_id, disable_notification=False)
+                        except ValueError:
+                            error_msg = "❌ Invalid number format.\nUsage: /setminequity AMOUNT\nExample: /setminequity 9600"
+                            self.telegram_bot.send_message(error_msg, chat_id=chat_id, disable_notification=False)
+                        except Exception as e:
+                            self.logger.error(f"Error in /setminequity command: {e}")
+                    
+                    # Handle /resetequity command (reset emergency state)
+                    elif text == '/resetequity':
+                        if self.equity_emergency_triggered:
+                            current_equity = self.get_current_equity()
+                            if self.min_equity_threshold and current_equity <= self.min_equity_threshold:
+                                error_msg = (
+                                    f"❌ <b>Cannot reset - equity still below threshold</b>\n\n"
+                                    f"• Current Equity: ${current_equity:.2f}\n"
+                                    f"• Minimum Threshold: ${self.min_equity_threshold:.2f}\n"
+                                    f"• Need to add: ${self.min_equity_threshold - current_equity:.2f}\n\n"
+                                    f"Please ensure equity is above ${self.min_equity_threshold:.2f} before resetting."
+                                )
+                                self.telegram_bot.send_message(error_msg, chat_id=chat_id, disable_notification=False)
+                            else:
+                                self.equity_emergency_triggered = False
+                                reset_msg = (
+                                    f"✅ <b>Equity Emergency State Reset</b>\n\n"
+                                    f"• Emergency stop cleared\n"
+                                    f"• Current Equity: ${current_equity:.2f}\n"
+                                    f"• Minimum Threshold: ${self.min_equity_threshold:.2f}\n\n"
+                                    f"🟢 You can now use /start to resume trading.\n\n"
+                                    f"⚠️ Emergency protection remains active!"
+                                )
+                                self.telegram_bot.send_message(reset_msg, chat_id=chat_id, disable_notification=False)
+                                self.logger.info("Equity emergency state reset by user")
+                        else:
+                            info_msg = "ℹ️ No equity emergency to reset. Bot is operating normally."
+                            self.telegram_bot.send_message(info_msg, chat_id=chat_id, disable_notification=False)
+
                     # Blackout window
                     elif text.startswith('/blackout'):
                         try:
                             parts = text.split()
                             if len(parts) == 1:
-                                # Show detailed blackout status
-                                gmt_plus_7 = timezone(timedelta(hours=7))
-                                now_gmt7 = datetime.now(gmt_plus_7)
-                                current_hour = now_gmt7.hour
-                                current_weekday = now_gmt7.weekday()  # Monday=0, Sunday=6
-                                current_time_str = now_gmt7.strftime('%A %H:%M')
-                                # Check current blackout status
-                                time_blackout = (
-                                    self.blackout_enabled and (
-                                        (self.blackout_start <= self.blackout_end and self.blackout_start <= current_hour < self.blackout_end) or
-                                        (self.blackout_start > self.blackout_end and (current_hour >= self.blackout_start or current_hour < self.blackout_end))
-                                    )
+                                state = 'on' if self.blackout_enabled else 'off'
+                                self.telegram_bot.send_message(
+                                    f"⛔️ Blackout {state}. Window: {self.blackout_start:02d}-{self.blackout_end:02d} GMT+7",
+                                    chat_id=chat_id,
+                                    disable_notification=False,
                                 )
-                                weekend_blackout = self.weekend_blackout_enabled and current_weekday in [5, 6]
-                                currently_in_blackout = time_blackout or weekend_blackout
-                                status_icon = "🔴" if currently_in_blackout else "🟢"
-                                status_text = "ACTIVE" if currently_in_blackout else "Inactive"
-                                msg = f"⛔️ <b>Risk Management Blackout</b>\n\n"
-                                msg += f"• Status: {status_icon} {status_text}\n"
-                                msg += f"• Current time: {current_time_str} GMT+7\n\n"
-                                # Show configurations
-                                msg += f"<b>Configuration:</b>\n"
-                                if self.blackout_enabled:
-                                    msg += f"• Time-based: {self.blackout_start:02d}:00-{self.blackout_end:02d}:00 GMT+7 daily\n"
-                                if self.weekend_blackout_enabled:
-                                    msg += f"• Weekend: Saturday-Sunday GMT+7\n"
-                                if not self.blackout_enabled and not self.weekend_blackout_enabled:
-                                    msg += f"• All blackouts disabled\n"
-                                msg += f"\n"
-                                # Current status and timing
-                                if currently_in_blackout:
-                                    action_info = "📊 New strategy cycles SUSPENDED\n🔄 Existing cycles continue until TP\n👁️ Monitoring all positions for TP/SL"
-                                else:
-                                    action_info = "📊 Normal strategy cycles active\n🕐 Blackouts suspend new cycles, existing complete"
-                                msg += f"<b>Current Effect:</b>\n{action_info}\n\n"
-                                msg += f"<b>Controls:</b>\n"
-                                msg += f"• /blackout time HH-HH - Set time window\n"
-                                msg += f"• /blackout weekend on/off - Toggle weekend\n"
-                                msg += f"• /blackout off - Disable all blackouts"
-                                self.telegram_bot.send_message(msg, chat_id=chat_id, disable_notification=False)
-                            elif len(parts) >= 2:
-                                command = parts[1].lower()
-                                if command == "weekend" and len(parts) >= 3:
-                                    # /blackout weekend on/off
-                                    toggle = parts[2].lower()
-                                    if toggle in ["on", "off"]:
-                                        self.weekend_blackout_enabled = (toggle == "on")
-                                        status_icon = "🔴" if self.weekend_blackout_enabled else "🔘"
-                                        status_text = "Enabled" if self.weekend_blackout_enabled else "Disabled"
-                                        msg = f"⛔️ <b>Weekend Blackout Updated</b>\n\n"
-                                        msg += f"• Status: {status_icon} {status_text}\n"
-                                        msg += f"• Effect: {'Saturday-Sunday blocked' if self.weekend_blackout_enabled else 'Weekend trading allowed'}\n\n"
-                                        msg += f"<b>Combined Blackout Status:</b>\n"
-                                        if self.blackout_enabled:
-                                            msg += f"• Time-based: {self.blackout_start:02d}:00-{self.blackout_end:02d}:00 GMT+7 daily\n"
-                                        if self.weekend_blackout_enabled:
-                                            msg += f"• Weekend: Saturday-Sunday GMT+7\n"
-                                        if not self.blackout_enabled and not self.weekend_blackout_enabled:
-                                            msg += f"• All blackouts disabled\n"
-                                        self.telegram_bot.send_message(msg, chat_id=chat_id, disable_notification=False)
-                                    else:
-                                        msg = "❌ Invalid weekend setting. Use: /blackout weekend on or /blackout weekend off"
-                                        self.telegram_bot.send_message(msg, chat_id=chat_id, disable_notification=False)
-                                elif command == "time" and len(parts) >= 3:
-                                    # /blackout time HH-HH
-                                    time_range = parts[2]
-                                    if '-' in time_range and time_range.count('-') == 1:
-                                        try:
-                                            start_str, end_str = time_range.split('-')
-                                            start_hour = int(start_str)
-                                            end_hour = int(end_str)
-                                            if 0 <= start_hour <= 23 and 0 <= end_hour <= 23:
-                                                self.blackout_start = start_hour
-                                                self.blackout_end = end_hour
-                                                self.blackout_enabled = True
-                                                msg = f"⛔️ <b>Time Blackout Updated</b>\n\n"
-                                                msg += f"• Status: 🔴 Enabled\n"
-                                                msg += f"• Window: {self.blackout_start:02d}:00-{self.blackout_end:02d}:00 GMT+7 daily\n\n"
-                                                msg += f"<b>Combined Blackout Status:</b>\n"
-                                                if self.blackout_enabled:
-                                                    msg += f"• Time-based: {self.blackout_start:02d}:00-{self.blackout_end:02d}:00 GMT+7 daily\n"
-                                                if self.weekend_blackout_enabled:
-                                                    msg += f"• Weekend: Saturday-Sunday GMT+7\n"
-                                                self.telegram_bot.send_message(msg, chat_id=chat_id, disable_notification=False)
-                                            else:
-                                                msg = "❌ Invalid time range. Hours must be 0-23. Example: /blackout time 02-06"
-                                                self.telegram_bot.send_message(msg, chat_id=chat_id, disable_notification=False)
-                                        except ValueError:
-                                            msg = "❌ Invalid time format. Use: /blackout time HH-HH (Example: /blackout time 02-06)"
-                                            self.telegram_bot.send_message(msg, chat_id=chat_id, disable_notification=False)
-                                    else:
-                                        msg = "❌ Invalid time format. Use: /blackout time HH-HH (Example: /blackout time 02-06)"
-                                        self.telegram_bot.send_message(msg, chat_id=chat_id, disable_notification=False)
-                                elif command == "off":
-                                    # /blackout off - disable all blackouts
-                                    self.blackout_enabled = False
-                                    self.weekend_blackout_enabled = False
-                                    msg = f"⛔️ <b>All Blackouts Disabled</b>\n\n"
-                                    msg += f"• Status: 🔘 Disabled\n"
-                                    msg += f"• Normal grid placement active 24/7\n\n"
-                                    msg += f"<b>Controls:</b>\n"
-                                    msg += f"• /blackout time HH-HH - Enable time window\n"
-                                    msg += f"• /blackout weekend on - Enable weekend blackout"
-                                    self.telegram_bot.send_message(msg, chat_id=chat_id, disable_notification=False)
-                                elif '-' in parts[1] and parts[1].count('-') == 1:
-                                    # Legacy format: /blackout HH-HH (backward compatibility)
-                                    try:
-                                        start_str, end_str = parts[1].split('-')
-                                        start_hour = int(start_str)
-                                        end_hour = int(end_str)
-                                        if 0 <= start_hour <= 23 and 0 <= end_hour <= 23:
-                                            self.blackout_start = start_hour
-                                            self.blackout_end = end_hour
-                                            self.blackout_enabled = True
-                                            msg = f"⛔️ <b>Time Blackout Updated</b>\n\n"
-                                            msg += f"• Status: 🔴 Enabled\n"
-                                            msg += f"• Window: {self.blackout_start:02d}:00-{self.blackout_end:02d}:00 GMT+7 daily\n\n"
-                                            msg += f"<b>Combined Blackout Status:</b>\n"
-                                            if self.blackout_enabled:
-                                                msg += f"• Time-based: {self.blackout_start:02d}:00-{self.blackout_end:02d}:00 GMT+7 daily\n"
-                                            if self.weekend_blackout_enabled:
-                                                msg += f"• Weekend: Saturday-Sunday GMT+7\n"
-                                            self.telegram_bot.send_message(msg, chat_id=chat_id, disable_notification=False)
-                                        else:
-                                            msg = "❌ Invalid time range. Hours must be 0-23. Example: /blackout 02-06"
-                                            self.telegram_bot.send_message(msg, chat_id=chat_id, disable_notification=False)
-                                    except ValueError:
-                                        msg = "❌ Invalid format. Use: /blackout HH-HH or /blackout time HH-HH or /blackout weekend on/off"
-                                        self.telegram_bot.send_message(msg, chat_id=chat_id, disable_notification=False)
-                                else:
-                                    msg = "❌ Unknown command. Available:\n"
-                                    msg += "• /blackout - Show status\n"
-                                    msg += "• /blackout time HH-HH - Set time window\n" 
-                                    msg += "• /blackout weekend on/off - Toggle weekend\n"
-                                    msg += "• /blackout off - Disable all"
-                                    self.telegram_bot.send_message(msg, chat_id=chat_id, disable_notification=False)
+                            elif len(parts) == 2 and parts[1].lower() == 'off':
+                                self.blackout_enabled = False
+                                self.telegram_bot.send_message("⛔️ Blackout disabled.", chat_id=chat_id, disable_notification=False)
+                            elif len(parts) == 2 and '-' in parts[1]:
+                                start_s, end_s = parts[1].split('-', 1)
+                                start, end = int(start_s), int(end_s)
+                                if not (0 <= start <= 23 and 0 <= end <= 23):
+                                    raise ValueError('Hours must be 0-23')
+                                self.blackout_start, self.blackout_end = start, end
+                                self.blackout_enabled = True
+                                self.telegram_bot.send_message(
+                                    f"⛔️ Blackout set: {start:02d}-{end:02d} GMT+7 (enabled)",
+                                    chat_id=chat_id,
+                                    disable_notification=False,
+                                )
+                            else:
+                                self.telegram_bot.send_message("Usage: /blackout HH-HH or /blackout off", chat_id=chat_id, disable_notification=False)
                         except Exception as e:
                             self.logger.error(f"Error handling /blackout: {e}")
                             self.telegram_bot.send_message("❌ Failed to set blackout.", chat_id=chat_id, disable_notification=False)
+
+                    # Trading halt window
+                    elif text.startswith('/tradinghalt'):
+                        try:
+                            parts = text.split()
+                            if len(parts) == 1:
+                                status = 'ON' if self.trading_halt_enabled else 'OFF'
+                                current_status = '🛑 ACTIVE' if self.trading_halt_active else '⚪ Inactive'
+                                now_local = datetime.now()
+                                info_msg = (
+                                    f"🛑 <b>TRADING HALT CONFIGURATION</b>\n\n"
+                                    f"📊 <b>Current Status:</b>\n"
+                                    f"┣━ 🔧 Feature: <b>{status}</b>\n"
+                                    f"┣━ 📅 Schedule: <code>04:00-06:30 GMT+7</code>\n"
+                                    f"┣━ ⚡ Current: <b>{current_status}</b>\n"
+                                    f"┗━ 🕐 Now: <code>{now_local.strftime('%H:%M')}</code>\n\n"
+                                    f"💡 <b>Commands:</b>\n"
+                                    f"┣━ <code>/tradinghalt on</code> - Enable protection\n"
+                                    f"┗━ <code>/tradinghalt off</code> - Disable protection\n\n"
+                                    f"<i>🛡️ Protects against early morning news volatility</i>"
+                                )
+                                self.telegram_bot.send_message(info_msg, chat_id=chat_id, disable_notification=False)
+                            elif len(parts) == 2 and parts[1].lower() == 'on':
+                                self.trading_halt_enabled = True
+                                self.telegram_bot.send_message(
+                                    f"✅ <b>Trading Halt Enabled</b>\n\n"
+                                    f"🛑 No new orders during 04:00-06:30 GMT+7\n"
+                                    f"🛡️ News volatility protection active", 
+                                    chat_id=chat_id, disable_notification=False
+                                )
+                            elif len(parts) == 2 and parts[1].lower() == 'off':
+                                self.trading_halt_enabled = False
+                                self.trading_halt_active = False  # Clear current halt if active
+                                self.telegram_bot.send_message(
+                                    f"❌ <b>Trading Halt Disabled</b>\n\n"
+                                    f"⚠️ Bot will trade during all hours\n"
+                                    f"🚨 Higher risk during news periods", 
+                                    chat_id=chat_id, disable_notification=False
+                                )
+                            else:
+                                self.telegram_bot.send_message(
+                                    f"📖 <b>Trading Halt Usage</b>\n\n"
+                                    f"<code>/tradinghalt</code> - Show status\n"
+                                    f"<code>/tradinghalt on</code> - Enable\n"
+                                    f"<code>/tradinghalt off</code> - Disable\n\n"
+                                    f"🛑 Prevents new orders 04:00-06:30", 
+                                    chat_id=chat_id, disable_notification=False
+                                )
+                        except Exception as e:
+                            self.logger.error(f"Error handling /tradinghalt: {e}")
+                            self.telegram_bot.send_message("❌ Failed to configure trading halt.", chat_id=chat_id, disable_notification=False)
+
                     # Quiet hours
                     elif text.startswith('/quiethours'):
                         try:
@@ -2050,191 +2222,7 @@ class GridDCAStrategy:
                         except Exception as e:
                             self.logger.error(f"Error handling /quiethours: {e}")
                             self.telegram_bot.send_message("❌ Failed to configure quiet hours.", chat_id=chat_id, disable_notification=False)
-                    # Max reduce protection
-                    elif text.startswith('/maxreduce'):
-                        try:
-                            parts = text.split()
-                            if len(parts) == 1:
-                                # Show current max reduce status
-                                status_icon = "🛡️" if self.max_reduce_enabled else "🔘"
-                                status_text = "Enabled" if self.max_reduce_enabled else "Disabled"
-                                
-                                msg = f"🛡️ <b>Max Reduce Protection</b>\n\n"
-                                msg += f"• Status: {status_icon} {status_text}\n"
-                                msg += f"• Start balance: ${self.start_balance:.2f}\n"
-                                
-                                # Show current mode and limits
-                                if self.max_reduce_use_percentage and self.max_reduce_percentage:
-                                    msg += f"• Mode: Percentage-based ({self.max_reduce_percentage}%)\n"
-                                    max_reduce_amount = self.start_balance * (self.max_reduce_percentage / 100.0)
-                                    msg += f"• Max reduce limit: ${max_reduce_amount:.2f}\n"
-                                else:
-                                    msg += f"• Mode: Fixed amount\n"
-                                    msg += f"• Max reduce limit: ${self.max_reduce_balance:.2f}\n"
-                                
-                                if self.max_reduce_enabled:
-                                    current_equity = self.get_current_equity()
-                                    drawdown = self.start_balance - current_equity
-                                    msg += f"• Emergency threshold: ${self.max_reduce_threshold_equity:.2f}\n"
-                                    msg += f"• Current equity: ${current_equity:.2f}\n"
-                                    msg += f"• Current drawdown: ${drawdown:.2f}\n"
-                                    msg += f"• Peak drawdown: ${self.max_reduce_peak_drawdown:.2f}\n"
-                                    msg += f"• Remaining buffer: ${current_equity - self.max_reduce_threshold_equity:.2f}\n"
-                                    
-                                    if self.max_reduce_triggered:
-                                        msg += f"\n🚨 Emergency stop TRIGGERED"
-                                        if self.max_reduce_trigger_time:
-                                            msg += f" at {self.max_reduce_trigger_time.strftime('%H:%M:%S')}"
-                                        msg += f"\n"
-                                    elif current_equity <= self.max_reduce_threshold_equity:
-                                        msg += f"\n⚠️ At emergency threshold!\n"
-                                
-                                msg += f"\n<b>Controls:</b>\n"
-                                msg += f"• /maxreduce on/off - Toggle protection\n"
-                                msg += f"• /maxreduce set AMOUNT - Set fixed amount limit\n"
-                                msg += f"• /maxreduce percent XX - Set percentage limit\n"
-                                msg += f"• /maxreduce mode fixed/percent - Switch mode\n"
-                                msg += f"• /maxreduce reset - Reset after emergency stop"
-                                
-                                self.telegram_bot.send_message(msg, chat_id=chat_id, disable_notification=False)
-                            
-                            elif len(parts) >= 2:
-                                command = parts[1].lower()
-                                
-                                if command in ["on", "off"]:
-                                    # Toggle max reduce protection
-                                    self.max_reduce_enabled = (command == "on")
-                                    
-                                    if self.max_reduce_enabled and not self.max_reduce_triggered:
-                                        self.max_reduce_threshold_equity = self.start_balance - self.max_reduce_balance
-                                    
-                                    status_icon = "🛡️" if self.max_reduce_enabled else "🔘"
-                                    status_text = "Enabled" if self.max_reduce_enabled else "Disabled"
-                                    
-                                    msg = f"🛡️ <b>Max Reduce Protection {status_text}</b>\n\n"
-                                    if self.max_reduce_enabled:
-                                        msg += f"• Max reduce limit: {self.max_reduce_balance:.2f}\n"
-                                        msg += f"• Emergency threshold: {self.max_reduce_threshold_equity:.2f}"
-                                    else:
-                                        msg += f"• Protection disabled - no emergency stop"
-                                    
-                                    self.telegram_bot.send_message(msg, chat_id=chat_id, disable_notification=False)
-                                
-                                elif command == "set" and len(parts) >= 3:
-                                    # Set max reduce amount
-                                    try:
-                                        new_amount = float(parts[2])
-                                        if new_amount <= 0:
-                                            raise ValueError("Amount must be positive")
-                                        
-                                        self.max_reduce_balance = new_amount
-                                        self.max_reduce_use_percentage = False  # Switch to fixed mode
-                                        if self.max_reduce_enabled and not self.max_reduce_triggered:
-                                            self.max_reduce_threshold_equity = self.start_balance - self.max_reduce_balance
-                                        
-                                        msg = f"🛡️ <b>Max Reduce Limit Updated</b>\n\n"
-                                        msg += f"• Mode: Fixed amount\n"
-                                        msg += f"• New limit: ${self.max_reduce_balance:.2f}\n"
-                                        if self.max_reduce_enabled:
-                                            msg += f"• Emergency threshold: ${self.max_reduce_threshold_equity:.2f}"
-                                        else:
-                                            msg += f"• Protection currently disabled"
-                                        
-                                        self.telegram_bot.send_message(msg, chat_id=chat_id, disable_notification=False)
-                                    except ValueError as ve:
-                                        self.telegram_bot.send_message(f"❌ Invalid amount: {ve}", chat_id=chat_id, disable_notification=False)
-                                
-                                elif command == "percent" and len(parts) >= 3:
-                                    # Set percentage-based limit
-                                    try:
-                                        new_percentage = float(parts[2])
-                                        if new_percentage <= 0 or new_percentage >= 100:
-                                            raise ValueError("Percentage must be between 0 and 100")
-                                        
-                                        self.max_reduce_percentage = new_percentage
-                                        self.max_reduce_use_percentage = True  # Switch to percentage mode
-                                        if self.max_reduce_enabled and not self.max_reduce_triggered:
-                                            max_reduce_amount = self.start_balance * (self.max_reduce_percentage / 100.0)
-                                            self.max_reduce_threshold_equity = self.start_balance - max_reduce_amount
-                                        
-                                        msg = f"🛡️ <b>Max Reduce Limit Updated</b>\n\n"
-                                        msg += f"• Mode: Percentage-based\n"
-                                        msg += f"• New percentage: {self.max_reduce_percentage}%\n"
-                                        msg += f"• Calculated limit: ${max_reduce_amount:.2f}\n"
-                                        if self.max_reduce_enabled:
-                                            msg += f"• Emergency threshold: ${self.max_reduce_threshold_equity:.2f}"
-                                        else:
-                                            msg += f"• Protection currently disabled"
-                                        
-                                        self.telegram_bot.send_message(msg, chat_id=chat_id, disable_notification=False)
-                                    except ValueError as ve:
-                                        self.telegram_bot.send_message(f"❌ Invalid percentage: {ve}", chat_id=chat_id, disable_notification=False)
-                                
-                                elif command == "mode" and len(parts) >= 3:
-                                    # Switch between fixed and percentage modes
-                                    mode = parts[2].lower()
-                                    if mode in ["fixed", "percent", "percentage"]:
-                                        old_mode = "percentage" if self.max_reduce_use_percentage else "fixed"
-                                        self.max_reduce_use_percentage = (mode in ["percent", "percentage"])
-                                        
-                                        # Recalculate threshold if enabled
-                                        if self.max_reduce_enabled and not self.max_reduce_triggered:
-                                            if self.max_reduce_use_percentage and self.max_reduce_percentage:
-                                                max_reduce_amount = self.start_balance * (self.max_reduce_percentage / 100.0)
-                                                self.max_reduce_threshold_equity = self.start_balance - max_reduce_amount
-                                                limit_display = f"{self.max_reduce_percentage}% (${max_reduce_amount:.2f})"
-                                            else:
-                                                self.max_reduce_threshold_equity = self.start_balance - self.max_reduce_balance
-                                                limit_display = f"${self.max_reduce_balance:.2f}"
-                                        else:
-                                            limit_display = "N/A (protection disabled or triggered)"
-                                        
-                                        new_mode = "percentage" if self.max_reduce_use_percentage else "fixed"
-                                        msg = f"🛡️ <b>Max Reduce Mode Changed</b>\n\n"
-                                        msg += f"• Changed from: {old_mode} → {new_mode}\n"
-                                        msg += f"• Current limit: {limit_display}\n"
-                                        if self.max_reduce_enabled and not self.max_reduce_triggered:
-                                            msg += f"• Emergency threshold: ${self.max_reduce_threshold_equity:.2f}"
-                                        
-                                        self.telegram_bot.send_message(msg, chat_id=chat_id, disable_notification=False)
-                                    else:
-                                        self.telegram_bot.send_message("❌ Invalid mode. Use: fixed or percent", chat_id=chat_id, disable_notification=False)
-                                
-                                elif command == "reset":
-                                    # Reset after emergency stop
-                                    self.max_reduce_triggered = False
-                                    self.max_reduce_warning_sent = False  # Reset warning flag
-                                    self.max_reduce_peak_drawdown = 0  # Reset peak drawdown
-                                    self.max_reduce_trigger_time = None  # Clear trigger time
-                                    start_balance = self.get_current_balance()
-                                    self.start_balance = start_balance
-                                    
-                                    if self.max_reduce_enabled:
-                                        if self.max_reduce_use_percentage and self.max_reduce_percentage:
-                                            max_reduce_amount = self.start_balance * (self.max_reduce_percentage / 100.0)
-                                            self.max_reduce_threshold_equity = self.start_balance - max_reduce_amount
-                                        else:
-                                            self.max_reduce_threshold_equity = self.start_balance - self.max_reduce_balance
-                                    
-                                    msg = f"🛡️ <b>Max Reduce Protection Reset</b>\n\n"
-                                    msg += f"• New start balance: {self.start_balance:.2f}\n"
-                                    msg += f"• Max reduce limit: {self.max_reduce_balance:.2f}\n"
-                                    if self.max_reduce_enabled:
-                                        msg += f"• Emergency threshold: {self.max_reduce_threshold_equity:.2f}"
-                                    
-                                    self.telegram_bot.send_message(msg, chat_id=chat_id, disable_notification=False)
-                                
-                                else:
-                                    msg = "❌ Unknown command. Available:\n"
-                                    msg += "• /maxreduce - Show status\n"
-                                    msg += "• /maxreduce on/off - Toggle protection\n"
-                                    msg += "• /maxreduce set AMOUNT - Set limit\n"
-                                    msg += "• /maxreduce reset - Reset protection"
-                                    self.telegram_bot.send_message(msg, chat_id=chat_id, disable_notification=False)
-                                    
-                        except Exception as e:
-                            self.logger.error(f"Error handling /maxreduce: {e}")
-                            self.telegram_bot.send_message("❌ Failed to configure max reduce protection.", chat_id=chat_id, disable_notification=False)
+
                     # History
                     elif text.startswith('/history'):
                         try:
@@ -2274,6 +2262,7 @@ class GridDCAStrategy:
                         except Exception as e:
                             self.logger.error(f"Error handling /history: {e}")
                             self.telegram_bot.send_message("❌ Failed to fetch history.", chat_id=chat_id, disable_notification=False)
+
                     # PnL aggregation
                     elif text.startswith('/pnl'):
                         try:
@@ -2305,6 +2294,7 @@ class GridDCAStrategy:
                         except Exception as e:
                             self.logger.error(f"Error handling /pnl: {e}")
                             self.telegram_bot.send_message("❌ Failed to compute PnL.", chat_id=chat_id, disable_notification=False)
+
                     # Filled orders summary
                     elif text.strip().lower() == '/filled':
                         try:
@@ -2312,6 +2302,7 @@ class GridDCAStrategy:
                         except Exception as e:
                             self.logger.error(f"Error handling /filled: {e}")
                             self.telegram_bot.send_message("❌ Failed to show filled orders.", chat_id=chat_id, disable_notification=False)
+
                     # Pattern detection
                     elif text.strip().lower() == '/pattern':
                         try:
@@ -2327,6 +2318,7 @@ class GridDCAStrategy:
                         except Exception as e:
                             self.logger.error(f"Error handling /pattern: {e}")
                             self.telegram_bot.send_message("❌ Failed to compute pattern.", chat_id=chat_id, disable_notification=False)
+
                     # Balance chart generation
                     elif text.startswith('/balance'):
                         try:
@@ -2340,8 +2332,10 @@ class GridDCAStrategy:
                                 except ValueError:
                                     self.telegram_bot.send_message("❌ Invalid hours format. Use: /balance [hours]\nExample: /balance 12", chat_id=chat_id, disable_notification=False)
                                     continue
+                            
                             # Generate chart
                             chart_buffer, stats_msg = self.generate_balance_chart(hours)
+                            
                             if chart_buffer:
                                 # Send chart image
                                 chart_buffer.name = f"balance_chart_{hours}h.png"
@@ -2349,9 +2343,11 @@ class GridDCAStrategy:
                                 chart_buffer.close()
                             else:
                                 self.telegram_bot.send_message(f"📊 {stats_msg}", chat_id=chat_id, disable_notification=False)
+                                
                         except Exception as e:
                             self.logger.error(f"Error handling /balance: {e}")
                             self.telegram_bot.send_message("❌ Failed to generate balance chart.", chat_id=chat_id, disable_notification=False)
+
                     # Balance log file information
                     elif text.strip().lower() == '/balancelog':
                         try:
@@ -2366,10 +2362,12 @@ class GridDCAStrategy:
                                             record_count = sum(1 for _ in f) - 1  # Subtract header row
                                 except Exception:
                                     pass
+                                
                                 # Calculate logging duration
                                 duration_minutes = record_count  # Since we log every minute
                                 hours = duration_minutes // 60
                                 minutes = duration_minutes % 60
+                                
                                 msg = (
                                     "📊 <b>Balance Log Information</b>\n\n"
                                     f"• Log file: {os.path.basename(self.balance_log_file)}\n"
@@ -2388,10 +2386,12 @@ class GridDCAStrategy:
                                 )
                             else:
                                 msg = "📊 <b>Balance Log</b>\n\nNo log file created yet. The log will be initialized in <code>data/balances/</code> when the strategy starts running."
+                            
                             self.telegram_bot.send_message(msg, chat_id=chat_id, disable_notification=False)
                         except Exception as e:
                             self.logger.error(f"Error handling /balancelog: {e}")
                             self.telegram_bot.send_message("❌ Failed to get balance log info.", chat_id=chat_id, disable_notification=False)
+
         except Exception as e:
             # self.logger.error(f"Error in handle_telegram_command: {e}")
             pass
