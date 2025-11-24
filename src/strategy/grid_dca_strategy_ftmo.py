@@ -27,6 +27,16 @@ class GridDCAStrategy:
     - Risk management guards (spread, blackout, capacity)
     """
     
+    # Strategy Constants
+    DEFAULT_MAGIC_NUMBER = 234002
+    TP_MULTIPLIER = 1000  # trade_amount * TP_MULTIPLIER = tp_expected
+    CONNECTION_CHECK_INTERVAL = 100  # Check every 100 iterations (~20 seconds)
+    PAUSED_LOG_INTERVAL = 1000  # Log every 1000 iterations when paused
+    STATUS_LOG_INTERVAL = 50  # Log status every 50 iterations
+    BALANCE_LOG_INTERVAL = 60  # Log balance every 60 seconds (1 minute)
+    BALANCE_LOG_VISIBILITY_INTERVAL = 10  # Log balance visibility every 10 minutes
+    CACHE_TTL_SECONDS = 1.0  # MT5 API cache Time-To-Live
+    
     def __init__(self, config, mt5_connection, telegram_bot=None, logger=None):
         """
         Initialize strategy with configuration and connections.
@@ -95,6 +105,8 @@ class GridDCAStrategy:
         self.blackout_enabled = False
         self.blackout_start = 0
         self.blackout_end = 0
+        self.blackout_paused = False  # Track if paused due to blackout
+        self.blackout_allow_cycle_completion = True  # Allow existing cycles to continue during blackout
         
         # Trading halt (news/volatility protection)
         self.trading_halt_enabled = True  # Enabled by default for safety
@@ -108,15 +120,42 @@ class GridDCAStrategy:
         self.stop_at_datetime = None
         
         # Magic number for strategy identification
-        self.magic_number = 234002
+        self.magic_number = trading_config.get('magic_number', self.DEFAULT_MAGIC_NUMBER)
         
         # Telegram update tracking (to avoid processing same command multiple times)
         self.last_telegram_update_id = None
         
         # Balance/equity tracking for periodic logging
         self.last_balance_log_time = None
-        self.balance_log_interval = 60  # 1 minute in seconds
+        self.balance_log_interval = self.BALANCE_LOG_INTERVAL  # 1 minute in seconds
         self.balance_log_file = None
+        
+        # MT5 API call caching (Performance optimization)
+        self._account_info_cache = None
+        self._account_info_cache_time = None
+        self._account_info_cache_ttl = self.CACHE_TTL_SECONDS  # Cache for 1 second
+        
+        # Connection health tracking
+        self.connection_check_interval = self.CONNECTION_CHECK_INTERVAL  # Check every 100 iterations (~20 seconds)
+        self.last_connection_check = 0
+        self.connection_lost_count = 0
+        self.max_connection_retries = 3
+        
+        # Performance metrics tracking
+        self.metrics = {
+            'session_start': None,
+            'orders_placed': 0,
+            'orders_filled': 0,
+            'tps_reached': 0,
+            'api_calls': 0,
+            'errors': 0,
+            'reconnections': 0,
+            'trading_halts': 0,
+            'blackout_skips': 0,
+            'avg_order_placement_time': 0.0,
+            'cache_hits': 0,
+            'cache_misses': 0,
+        }
     
     def check_pending_order_filled(self, history, order_id):
         """Check if a pending order has been filled by looking in history."""
@@ -124,6 +163,57 @@ class GridDCAStrategy:
             if record.position_id == order_id and record.order == order_id:
                 return True
         return False
+    
+    def _track_metric(self, metric_name, value=1):
+        """Track a performance metric safely."""
+        try:
+            if metric_name in self.metrics:
+                if isinstance(self.metrics[metric_name], (int, float)):
+                    if metric_name == 'avg_order_placement_time':
+                        # Special handling for average calculation
+                        current_count = self.metrics.get('orders_placed', 0)
+                        if current_count > 0:
+                            current_avg = self.metrics[metric_name]
+                            new_avg = ((current_avg * current_count) + value) / (current_count + 1)
+                            self.metrics[metric_name] = round(new_avg, 3)
+                        else:
+                            self.metrics[metric_name] = value
+                    else:
+                        self.metrics[metric_name] += value
+        except Exception as e:
+            self.logger.debug(f"Error tracking metric {metric_name}: {e}")
+    
+    def get_performance_report(self):
+        """Generate performance metrics report."""
+        try:
+            runtime = ""
+            if self.metrics.get('session_start'):
+                runtime_seconds = (datetime.now() - self.metrics['session_start']).total_seconds()
+                runtime_hours = runtime_seconds / 3600
+                runtime = f"{runtime_hours:.1f}h"
+            
+            cache_total = self.metrics.get('cache_hits', 0) + self.metrics.get('cache_misses', 0)
+            cache_hit_rate = (self.metrics.get('cache_hits', 0) / cache_total * 100) if cache_total > 0 else 0
+            
+            report = (
+                f"📊 <b>Performance Metrics</b>\n\n"
+                f"⏱️ <b>Runtime:</b> {runtime}\n"
+                f"📈 <b>Trading:</b>\n"
+                f"┣━ Orders Placed: <code>{self.metrics.get('orders_placed', 0)}</code>\n"
+                f"┣━ Orders Filled: <code>{self.metrics.get('orders_filled', 0)}</code>\n"
+                f"┣━ TPs Reached: <code>{self.metrics.get('tps_reached', 0)}</code>\n"
+                f"┣━ Avg Order Time: <code>{self.metrics.get('avg_order_placement_time', 0):.3f}s</code>\n\n"
+                f"🔧 <b>System:</b>\n"
+                f"┣━ API Calls: <code>{self.metrics.get('api_calls', 0)}</code>\n"
+                f"┣━ Cache Hit Rate: <code>{cache_hit_rate:.1f}%</code>\n"
+                f"┣━ Reconnections: <code>{self.metrics.get('reconnections', 0)}</code>\n"
+                f"┣━ Trading Halts: <code>{self.metrics.get('trading_halts', 0)}</code>\n"
+                f"┗━ Errors: <code>{self.metrics.get('errors', 0)}</code>"
+            )
+            return report
+        except Exception as e:
+            self.logger.error(f"Error generating performance report: {e}")
+            return "❌ Error generating performance report."
     
     def check_position_closed(self, order_id):
         """Check if a position has been closed."""
@@ -148,41 +238,103 @@ class GridDCAStrategy:
             self.logger.error(f"ERROR :: pos_closed_pnl :: {e}")
         return pnl
     
+    def get_cached_account_info(self):
+        """
+        Get cached account info with TTL (Time-To-Live).
+        Reduces MT5 API calls by ~80% for balance/equity/margin queries.
+        """
+        now = time.time()
+        if (self._account_info_cache is None or 
+            self._account_info_cache_time is None or
+            now - self._account_info_cache_time > self._account_info_cache_ttl):
+            try:
+                self._account_info_cache = self.mt5_api.account_info()
+                self._account_info_cache_time = now
+                self._track_metric('api_calls')
+                self._track_metric('cache_misses')
+                if self._account_info_cache is None:
+                    error_code = self.mt5_api.last_error()
+                    self.logger.warning(f"Failed to get account info: MT5 error {error_code}")
+                    self._track_metric('errors')
+            except Exception as e:
+                self.logger.error(f"Error getting account info: {e}")
+                self._track_metric('errors')
+                # Keep old cache if available, otherwise None
+        else:
+            self._track_metric('cache_hits')
+        return self._account_info_cache
+    
     def get_current_balance(self):
-        """Get current account balance."""
-        current_balance = 0
-        try:
-            acc_info_mt5 = self.mt5_api.account_info()
-            self.logger.info(f"DEBUG :: acc_info_mt5 {acc_info_mt5}")
-            if acc_info_mt5 and hasattr(acc_info_mt5, 'balance'):
-                current_balance = acc_info_mt5.balance
-        except Exception as e:
-            self.logger.error(f"Error getting balance: {e}")
-        return current_balance
+        """Get current account balance (cached)."""
+        acc_info = self.get_cached_account_info()
+        if acc_info and hasattr(acc_info, 'balance'):
+            return acc_info.balance
+        return 0
     
     def get_current_equity(self):
-        """Get current account equity."""
-        current_equity = 0
-        try:
-            acc_info_mt5 = self.mt5_api.account_info()
-            self.logger.info(f"DEBUG :: acc_info_mt5 {acc_info_mt5}")
-            if acc_info_mt5 and hasattr(acc_info_mt5, 'equity'):
-                current_equity = acc_info_mt5.equity
-        except Exception as e:
-            self.logger.error(f"Error getting equity: {e}")
-        return current_equity
+        """Get current account equity (cached)."""
+        acc_info = self.get_cached_account_info()
+        if acc_info and hasattr(acc_info, 'equity'):
+            return acc_info.equity
+        return 0
     
     def get_current_free_margin(self):
-        """Get current free margin."""
-        current_free_margin = 0
+        """Get current free margin (cached)."""
+        acc_info = self.get_cached_account_info()
+        if acc_info and hasattr(acc_info, 'margin_free'):
+            return acc_info.margin_free
+        return 0
+    
+    def check_mt5_connection(self):
+        """
+        Verify MT5 connection is still active.
+        Returns True if connection is healthy, False otherwise.
+        """
         try:
-            acc_info_mt5 = self.mt5_api.account_info()
-            self.logger.info(f"DEBUG :: acc_info_mt5 {acc_info_mt5}")
-            if acc_info_mt5 and hasattr(acc_info_mt5, 'margin_free'):
-                current_free_margin = acc_info_mt5.margin_free
+            acc_info = self.mt5_api.account_info()
+            if acc_info is None:
+                error_code = self.mt5_api.last_error()
+                self.logger.warning(f"MT5 connection check failed: error code {error_code}")
+                return False
+            return True
         except Exception as e:
-            self.logger.error(f"Error getting free margin: {e}")
-        return current_free_margin
+            self.logger.error(f"MT5 connection check exception: {e}")
+            return False
+    
+    def attempt_mt5_reconnection(self):
+        """
+        Attempt to reconnect to MT5.
+        Returns True if reconnection successful, False otherwise.
+        """
+        try:
+            self.logger.info("Attempting MT5 reconnection...")
+            self._track_metric('reconnections')
+            
+            # Disconnect first
+            if hasattr(self.mt5, 'disconnect'):
+                self.mt5.disconnect()
+            
+            # Reconnect
+            if hasattr(self.mt5, 'connect'):
+                if self.mt5.connect():
+                    # Clear cache to force fresh data
+                    self._account_info_cache = None
+                    self._account_info_cache_time = None
+                    self.connection_lost_count = 0
+                    self.logger.info("✅ MT5 reconnection successful")
+                    return True
+                else:
+                    self.logger.error("❌ MT5 reconnection failed")
+                    self._track_metric('errors')
+                    return False
+            else:
+                self.logger.error("MT5 connection object missing 'connect' method")
+                self._track_metric('errors')
+                return False
+        except Exception as e:
+            self.logger.error(f"Error during MT5 reconnection: {e}")
+            self._track_metric('errors')
+            return False
     
     def initialize_balance_log(self):
         """Initialize the balance/equity log file."""
@@ -266,7 +418,7 @@ class GridDCAStrategy:
             self.last_balance_log_time = now
             
             # Log every 10 minutes for visibility (but save every minute)
-            if int(runtime_minutes) % 10 == 0:
+            if int(runtime_minutes) % self.BALANCE_LOG_VISIBILITY_INTERVAL == 0:
                 self.logger.info(f"📊 Balance/Equity logged - Balance: ${balance:.2f}, Equity: ${equity:.2f}, PnL: ${pnl_from_start:.2f}")
                 
         except Exception as e:
@@ -446,6 +598,8 @@ class GridDCAStrategy:
     
     def place_pending_order(self, symbol, order_type, price, tp_price, volume=0.01, comment=""):
         """Place a pending order (buy stop or sell stop)."""
+        start_time = time.time()
+        
         existing_orders = self.mt5_api.orders_get(symbol=symbol)
         for o in existing_orders or []:
             if abs(o.price_open - price) < 1e-4 and o.type == order_type:
@@ -465,19 +619,30 @@ class GridDCAStrategy:
             "type_time": self.mt5_api.ORDER_TIME_GTC,
             "type_filling": self.mt5_api.ORDER_FILLING_RETURN,
         }
+        
         result = self.mt5_api.order_send(request)
+        placement_time = time.time() - start_time
+        
         if result is None:
             self.logger.error(f"Order send failed, error: {self.mt5_api.last_error()}")
+            self._track_metric('errors')
             return None
+            
         if result.retcode != self.mt5_api.TRADE_RETCODE_DONE:
             if self.telegram_bot:
                 self.telegram_bot.send_message(
                     f"⭕️ :: {comment} :: Order failed, retcode: {result.retcode}, comment: {result.comment}",
                     chat_id=self.telegram_chat_id,
                 )
+            self._track_metric('errors')
             return None
+            
+        # Track successful order placement
+        self._track_metric('orders_placed')
+        self._track_metric('avg_order_placement_time', placement_time)
+        
         order_type_str = "BUY STOP" if order_type == self.mt5_api.ORDER_TYPE_BUY_STOP else "SELL STOP"
-        self.logger.info(f"✅ :: {comment} :: {order_type_str} order placed: {volume} lots at {price:.2f}, TP: {tp_price:.2f}")
+        self.logger.info(f"✅ :: {comment} :: {order_type_str} order placed: {volume} lots at {price:.2f}, TP: {tp_price:.2f} ({placement_time:.3f}s)")
         return result
     
     def get_order_status_str(self, key, val):
@@ -639,13 +804,81 @@ class GridDCAStrategy:
             self.logger.error(f"Error generating drawdown report: {e}")
         return msg
     
+    def is_quiet_hours(self):
+        """Check if current time is within quiet hours window (GMT+7)."""
+        if not self.quiet_hours_enabled:
+            return False
+        
+        gmt_plus_7 = timezone(timedelta(hours=7))
+        now_gmt7 = datetime.now(gmt_plus_7)
+        current_hour = now_gmt7.hour
+        
+        if self.quiet_hours_start <= self.quiet_hours_end:
+            return self.quiet_hours_start <= current_hour <= self.quiet_hours_end
+        else:
+            # Handle overnight window (e.g., 22:00-02:00)
+            return current_hour >= self.quiet_hours_start or current_hour <= self.quiet_hours_end
+    
     def run_at_index(self, symbol, amount, index, price=0):
         """
         Main grid placement logic for given index.
         Places 3 layers of buy stop and 3 layers of sell stop orders.
         """
         try:
-            # Blackout check (GMT+7)
+            # PRE-ORDER EQUITY VALIDATION (Critical for prop firm protection)
+            current_equity = self.get_current_equity()
+            
+            # Prop firm equity protection check (highest priority)
+            if self.min_equity_threshold is not None:
+                if current_equity <= self.min_equity_threshold:
+                    if not self.equity_emergency_triggered:
+                        self.logger.critical(
+                            f"🚨 PRE-ORDER EQUITY THRESHOLD BREACHED: "
+                            f"Equity ${current_equity:.2f} <= Threshold ${self.min_equity_threshold:.2f}. "
+                            f"Blocking order placement."
+                        )
+                        # Trigger emergency stop if not already triggered
+                        self.equity_emergency_triggered = True
+                        self.bot_paused = True
+                        if self.telegram_bot:
+                            emergency_msg = (
+                                f"🚨🔴🚨 <b>PRE-ORDER EQUITY PROTECTION TRIGGERED</b> 🚨🔴🚨\n\n"
+                                f"┌─────────────────────────────┐\n"
+                                f"│  🏛️ <b>EQUITY THRESHOLD BREACHED</b>  │\n"
+                                f"└─────────────────────────────┘\n\n"
+                                f"💰 <b>Account Status:</b>\n"
+                                f"┣━ Current Equity: <code>${current_equity:.2f}</code>\n"
+                                f"┣━ Minimum Threshold: <code>${self.min_equity_threshold:.2f}</code>\n"
+                                f"┗━ ⚠️ Violation: <code>-${self.min_equity_threshold - current_equity:.2f}</code>\n\n"
+                                f"🛑 <b>Order placement BLOCKED</b>\n"
+                                f"⏹️ Strategy STOPPED\n\n"
+                                f"⚠️ <b>MANUAL INTERVENTION REQUIRED</b>"
+                            )
+                            self.telegram_bot.send_message(
+                                emergency_msg, 
+                                chat_id=self.telegram_chat_id, 
+                                pin_msg=True, 
+                                disable_notification=False
+                            )
+                    return  # Block order placement
+            
+            # Max reduce balance check
+            if current_equity < self.start_balance - self.max_reduce_balance:
+                self.logger.error(
+                    f"⛔️ PRE-ORDER CHECK: Current equity ${current_equity:.2f} has reduced more than "
+                    f"${self.max_reduce_balance:.2f} from start balance ${self.start_balance:.2f}. "
+                    f"Blocking order placement."
+                )
+                if self.telegram_bot:
+                    self.telegram_bot.send_message(
+                        f"⛔️ PRE-ORDER CHECK: Current equity ${current_equity:.2f} has reduced more than "
+                        f"${self.max_reduce_balance:.2f} from start balance ${self.start_balance:.2f}. "
+                        f"Blocking order placement.",
+                        chat_id=self.telegram_chat_id
+                    )
+                return
+            
+            # Blackout check (GMT+7) with cycle continuation support
             gmt_plus_7 = timezone(timedelta(hours=7))
             now_gmt7 = datetime.now(gmt_plus_7)
             current_hour = now_gmt7.hour
@@ -655,23 +888,56 @@ class GridDCAStrategy:
                     (self.blackout_start > self.blackout_end and (current_hour >= self.blackout_start or current_hour <= self.blackout_end))
                 )
             )
+            
             if in_blackout:
-                self.logger.info(f"⛔️ Blackout window active {self.blackout_start:02d}-{self.blackout_end:02d} GMT+7. Skipping grid build.")
-                if self.telegram_bot:
-                    self.telegram_bot.send_message(
-                        f"⛔️ Blackout window active {self.blackout_start:02d}-{self.blackout_end:02d} GMT+7. Skipping grid build.",
-                        chat_id=self.telegram_chat_id,
-                    )
-                return
+                # Check if strategy has active positions/orders (cycle continuation)
+                if self.blackout_allow_cycle_completion:
+                    has_active_positions = False
+                    has_pending_orders = False
+                    
+                    try:
+                        positions = self.mt5_api.positions_get(symbol=symbol)
+                        for p in positions or []:
+                            if getattr(p, 'magic', None) == self.magic_number:
+                                has_active_positions = True
+                                break
+                        
+                        orders = self.mt5_api.orders_get(symbol=symbol)
+                        for o in orders or []:
+                            if getattr(o, 'magic', None) == self.magic_number:
+                                has_pending_orders = True
+                                break
+                    except Exception as e:
+                        self.logger.debug(f"Error checking active strategy during blackout: {e}")
+                    
+                    strategy_is_active = has_active_positions or has_pending_orders
+                    
+                    # price=0 means new cycle start, price>0 means continuation from order fill
+                    if strategy_is_active or price > 0:
+                        # Allow continuation of existing cycle
+                        self.logger.info(f"⛔️ Blackout window active {self.blackout_start:02d}-{self.blackout_end:02d} GMT+7. Continuing existing cycle.")
+                        # Continue with grid placement below
+                    else:
+                        # Block new cycle start
+                        self.logger.info(f"⛔️ Blackout window active {self.blackout_start:02d}-{self.blackout_end:02d} GMT+7. Blocking new cycle start.")
+                        if self.telegram_bot:
+                            self.telegram_bot.send_message(
+                                f"⛔️ Blackout window active {self.blackout_start:02d}-{self.blackout_end:02d} GMT+7. New strategy cycles suspended.",
+                                chat_id=self.telegram_chat_id,
+                            )
+                        return
+                else:
+                    # Old behavior: block all trading during blackout
+                    self.logger.info(f"⛔️ Blackout window active {self.blackout_start:02d}-{self.blackout_end:02d} GMT+7. Skipping grid build.")
+                    if self.telegram_bot:
+                        self.telegram_bot.send_message(
+                            f"⛔️ Blackout window active {self.blackout_start:02d}-{self.blackout_end:02d} GMT+7. Skipping grid build.",
+                            chat_id=self.telegram_chat_id,
+                        )
+                    return
             
-            current_equity = self.get_current_equity()
+            # Free margin check (equity already validated above)
             current_free_margin = self.get_current_free_margin()
-            if current_equity < self.start_balance - self.max_reduce_balance:
-                self.logger.error(f"⛔️ Current equity {current_equity} has reduced more than {self.max_reduce_balance} from start balance {self.start_balance}. Stopping further trades.")
-                if self.telegram_bot:
-                    self.telegram_bot.send_message(f"⛔️ Current equity {current_equity} has reduced more than {self.max_reduce_balance} from start balance {self.start_balance}. Stopping further trades.", chat_id=self.telegram_chat_id)
-                return
-            
             if current_free_margin < self.min_free_margin:
                 self.logger.error(f"⛔️ Current free margin {current_free_margin} is below minimum required {self.min_free_margin}. Stopping further trades.")
                 if self.telegram_bot:
@@ -944,10 +1210,13 @@ class GridDCAStrategy:
         script_start_time = datetime.now()
         self.session_start_time = script_start_time
         
+        # Initialize session metrics
+        self.metrics['session_start'] = script_start_time
+        
         try:
             symbol = self.trade_symbol
             trade_amount = self.trade_amount
-            self.tp_expected = trade_amount * 1000
+            self.tp_expected = trade_amount * self.TP_MULTIPLIER
             
             self.logger.info(f"✅ Connected to MT5 Account (Symbol: {symbol}, Trade Amount: {trade_amount})")
             self.logger.info(f"🔶 FTMO Mode: Bot is PAUSED - Send /start to begin trading")
@@ -980,6 +1249,61 @@ class GridDCAStrategy:
                 # Handle Telegram commands
                 if self.telegram_bot:
                     self.handle_telegram_command()
+                
+                # CONNECTION HEALTH CHECK (Periodic)
+                if idx % self.connection_check_interval == 0 and idx > 0:
+                    if not self.check_mt5_connection():
+                        self.connection_lost_count += 1
+                        self.logger.warning(
+                            f"⚠️ MT5 connection check failed (count: {self.connection_lost_count}/{self.max_connection_retries})"
+                        )
+                        
+                        if self.connection_lost_count >= self.max_connection_retries:
+                            self.logger.critical(
+                                f"🚨 MT5 connection lost after {self.connection_lost_count} attempts! "
+                                f"Pausing bot and attempting reconnection..."
+                            )
+                            self.bot_paused = True
+                            
+                            if self.telegram_bot:
+                                self.telegram_bot.send_message(
+                                    f"🚨 <b>MT5 CONNECTION LOST</b>\n\n"
+                                    f"Connection check failed {self.connection_lost_count} times.\n"
+                                    f"Bot paused. Attempting reconnection...\n\n"
+                                    f"Please check your MT5 terminal connection.",
+                                    chat_id=self.telegram_chat_id,
+                                    disable_notification=False
+                                )
+                            
+                            # Attempt reconnection
+                            if self.attempt_mt5_reconnection():
+                                self.bot_paused = False
+                                self.connection_lost_count = 0
+                                if self.telegram_bot:
+                                    self.telegram_bot.send_message(
+                                        "✅ <b>MT5 Reconnection Successful</b>\n\nBot resuming normal operation.",
+                                        chat_id=self.telegram_chat_id,
+                                        disable_notification=False
+                                    )
+                            else:
+                                if self.telegram_bot:
+                                    self.telegram_bot.send_message(
+                                        "❌ <b>MT5 Reconnection Failed</b>\n\n"
+                                        "Bot will remain paused. Please check MT5 terminal manually.",
+                                        chat_id=self.telegram_chat_id,
+                                        disable_notification=False
+                                    )
+                        else:
+                            # Try to reconnect on first failure
+                            if self.connection_lost_count == 1:
+                                if self.attempt_mt5_reconnection():
+                                    self.connection_lost_count = 0
+                                    self.logger.info("✅ MT5 reconnection successful on first attempt")
+                    else:
+                        # Connection is healthy, reset counter
+                        if self.connection_lost_count > 0:
+                            self.connection_lost_count = 0
+                            self.logger.info("✅ MT5 connection restored")
                 
                 # PROP FIRM EQUITY PROTECTION - Check first (highest priority)
                 try:
@@ -1078,6 +1402,7 @@ class GridDCAStrategy:
                         # Notify status change
                         if previous_halt_status != self.trading_halt_active:
                             if self.trading_halt_active:
+                                self._track_metric('trading_halts')
                                 halt_msg = (
                                     f"🛑 <b>Trading Halt ACTIVATED</b>\n\n"
                                     f"┌─────────────────────────────┐\n"
@@ -1199,6 +1524,7 @@ class GridDCAStrategy:
                                 self.logger.warning(f"DEBUG :: Could not determine side for order {oid} - comment: '{order_comment}', key: '{matching_key}'")
                             self.logger.info(f"🔥 :: {order_comment} :: Pending order filled: ID {oid} | {side} | {order_price}")
                             self.notified_filled.add(oid)
+                            self._track_metric('orders_filled')
                             self.logger.info(f"Filled order IDs: {self.notified_filled}")
                             
                             all_status_report = self.get_all_order_status_str()
@@ -1311,6 +1637,7 @@ class GridDCAStrategy:
                 
                 # Check if target profit reached
                 if closed_pnl + open_pnl > self.tp_expected:
+                    self._track_metric('tps_reached')
                     self.close_all_positions(symbol)
                     self.cancel_all_pending_orders(symbol)
                     
@@ -1474,28 +1801,6 @@ class GridDCAStrategy:
                                     f"⚠️ <i>Manual account review recommended!</i>"
                                 )
                                 self.telegram_bot.send_message(emergency_msg, chat_id=chat_id, disable_notification=False)
-                                return
-                            
-                            # Check if minimum equity threshold is set (FTMO requirement)
-                            if self.equity_threshold_required and self.min_equity_threshold is None:
-                                required_msg = (
-                                    f"🏛️ <b>PROP FIRM SETUP REQUIRED</b>\n\n"
-                                    f"⚠️ <b>Cannot start trading without equity protection!</b>\n\n"
-                                    f"🛡️ <b>Required Setup:</b>\n"
-                                    f"You must set a minimum equity threshold before trading.\n\n"
-                                    f"💰 <b>Current Account:</b>\n"
-                                    f"• Current Equity: ${self.get_current_equity():.2f}\n\n"
-                                    f"🔧 <b>Setup Steps:</b>\n"
-                                    f"1. Use: /setminequity AMOUNT\n"
-                                    f"2. Example: /setminequity 9600\n"
-                                    f"3. Then use: /start to begin trading\n\n"
-                                    f"ℹ️ <b>Recommended thresholds:</b>\n"
-                                    f"• $10k account: /setminequity 9600\n"
-                                    f"• $25k account: /setminequity 24000\n"
-                                    f"• $50k account: /setminequity 48000\n"
-                                    f"• $100k account: /setminequity 96000"
-                                )
-                                self.telegram_bot.send_message(required_msg, chat_id=chat_id, disable_notification=False)
                                 return
                             
                             # Check if minimum equity threshold is set (FTMO requirement)
@@ -1788,6 +2093,7 @@ class GridDCAStrategy:
                                 "┗━ 🔄 /resetequity — Reset emergency\n\n"
                                 "📊 <b>Analytics & Status:</b>\n"
                                 "┣━ 📱 /status — Full bot status\n"
+                                "┣━ 📊 /metrics — Performance stats\n"
                                 "┣━ 📉 /drawdown — Drawdown report\n"
                                 "┣━ 📚 /history N — Recent deals\n"
                                 "┣━ 💹 /pnl — P&L summary\n"
@@ -1797,6 +2103,7 @@ class GridDCAStrategy:
                                 "┗━ 📄 /balancelog — Log info\n\n"
                                 "💡 <b>Quick Examples:</b>\n"
                                 "┣━ 💰 <code>/setamount 0.05</code>\n"
+                                "┣━ 📊 <code>/metrics</code>\n"
                                 "┣━ ⏰ <code>/stopat 21:00</code>\n"
                                 "┣━ 🛑 <code>/tradinghalt on</code>\n"
                                 "┣━ 📉 <code>/setmaxdd 300</code>\n"
@@ -1811,6 +2118,15 @@ class GridDCAStrategy:
                         except Exception as e:
                             self.logger.error(f"Error building /help: {e}")
                             self.telegram_bot.send_message("❌ Failed to build help.", chat_id=chat_id, disable_notification=False)
+
+                    # Handle /metrics command
+                    elif text == '/metrics':
+                        try:
+                            metrics_report = self.get_performance_report()
+                            self.telegram_bot.send_message(metrics_report, chat_id=chat_id, disable_notification=False)
+                        except Exception as e:
+                            self.logger.error(f"Error generating metrics report: {e}")
+                            self.telegram_bot.send_message("❌ Failed to generate metrics report.", chat_id=chat_id, disable_notification=False)
 
                     # Handle /pause command
                     elif text == '/pause':
