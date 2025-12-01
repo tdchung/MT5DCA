@@ -950,11 +950,27 @@ class GridDCAStrategy:
                 self.logger.error(f"Could not get tick for {symbol}")
                 return
             
-            # Spread cap
+            # Spread cap with XAU-specific protection
             try:
                 spread = (tick.ask - tick.bid) if (hasattr(tick, 'ask') and hasattr(tick, 'bid')) else 0.0
             except Exception:
                 spread = 0.0
+            
+            # XAU-specific spread protection: Block orders if spread > 0.4
+            if 'XAU' in symbol.upper() and spread > 0.4:
+                self.logger.info(f"⛔️ XAU Spread protection: {spread:.3f} > 0.4. Skipping grid build.")
+                if self.telegram_bot:
+                    self.telegram_bot.send_message(
+                        f"⛔️ <b>XAU Spread Protection Active</b>\n\n"
+                        f"• Current Spread: <code>{spread:.3f}</code>\n"
+                        f"• XAU Limit: <code>0.4</code>\n"
+                        f"• Action: Order placement blocked\n\n"
+                        f"🛡️ Protecting against high spread costs",
+                        chat_id=self.telegram_chat_id,
+                    )
+                return
+            
+            # General spread cap (if configured)
             if self.max_spread is not None and spread > self.max_spread:
                 self.logger.info(f"⛔️ Spread {spread:.3f} > max {self.max_spread:.3f}. Skipping grid build.")
                 if self.telegram_bot:
@@ -980,10 +996,10 @@ class GridDCAStrategy:
             try:
                 pattern_data = self.check_consecutive_orders_pattern()
                 if pattern_data.get('pattern_detected'):
-                    if len(pattern_data.get('consecutive_buys', [])) >= 2:
+                    if len(pattern_data.get('consecutive_buys', [])) >= 3:
                         self.logger.warning("⚠️ Strong upward trend detected - consider reducing BUY exposure")
                         pypass_buy1 = True
-                    if len(pattern_data.get('consecutive_sells', [])) >= 2:
+                    if len(pattern_data.get('consecutive_sells', [])) >= 3:
                         self.logger.warning("⚠️ Strong downward trend detected - consider reducing SELL exposure")
                         pypass_sell1 = True
             except Exception as e:
@@ -1528,7 +1544,18 @@ class GridDCAStrategy:
                             self.logger.info(f"Filled order IDs: {self.notified_filled}")
                             
                             all_status_report = self.get_all_order_status_str()
+                            
+                            # Extract index from matching_key for better formatting
+                            side_with_index = f"<b>{side}</b>"
+                            if matching_key and '_' in matching_key:
+                                try:
+                                    side_str, idx_str = matching_key.split('_', 1)
+                                    side_with_index = f"<b>{side} {idx_str}</b>"
+                                except:
+                                    side_with_index = f"<b>{side}</b>"
+                            
                             msg = f"🔥 <b>Pending order filled - {order_comment}</b>\n"
+                            msg += f"{side_with_index}\n"
                             msg += f"ID {oid} | {side} | {order_price:<.2f}\n\n"
                             msg += f"{all_status_report}\n{self.drawdown_report()}\n"
                             
@@ -1610,7 +1637,14 @@ class GridDCAStrategy:
                             self.logger.info(f"❤️ :: {order_comment} :: TP filled: Position ID {oid} closed | P&L: ${pnl:.2f} All Closed P&L: ${closed_pnl:.2f}")
                             self.logger.info(f"TP filled order IDs: {notified_tp}")
                             self.logger.info(f"TP filled: {hit_side} order index {self.current_idx} (ID {oid}) closed. TP price: {hit_tp_price}")
-                            msg = f"❤️❤️❤️ <b>TP filled - {order_comment}</b>\n\n"
+                            
+                            # Format side with index for better display
+                            side_with_index = f"<b>{hit_side}</b>"
+                            if hit_index is not None:
+                                side_with_index = f"<b>{hit_side}</b> {hit_index}"
+                            
+                            msg = f"❤️❤️❤️ <b>TP filled - {order_comment}</b>\n"
+                            msg += f"{side_with_index}\n"
                             msg += f"<b>Position ID:</b> {oid}\n"
                             msg += f"<b>P&L:</b> ${pnl:.2f}\n"
                             msg += f"<b>All Closed P&L:</b> ${closed_pnl:.2f}\n"
@@ -1876,7 +1910,7 @@ class GridDCAStrategy:
                                     if self.telegram_bot:
                                         self.telegram_bot.send_message(f"⚠️ Error placing initial grid: {e}", chat_id=chat_id)
                             else:
-                                # Regular resume
+                                # Regular resume - also place grid orders
                                 resume_msg = f"▶️ <b>Bot Resumed!</b>\n\n"
                                 resume_msg += f"• Account: {account_number}\n"
                                 resume_msg += f"• Symbol: {self.trade_symbol}\n"
@@ -1885,6 +1919,26 @@ class GridDCAStrategy:
                                 resume_msg += f"The bot will now resume trading operations."
                                 self.telegram_bot.send_message(resume_msg, chat_id=chat_id, disable_notification=False)
                                 self.logger.info(f"Bot resumed by user command from chat_id: {chat_id}")
+                                
+                                # Place grid orders when resuming from pause/stop
+                                try:
+                                    symbol = self.trade_symbol
+                                    trade_amount = self.trade_amount
+                                    self.run_at_index(symbol, trade_amount, index=self.current_idx, price=0)
+                                    self.logger.info("Grid placement completed after bot resume")
+                                    
+                                    # Send confirmation that orders were placed
+                                    if self.telegram_bot:
+                                        grid_msg = f"📊 <b>Grid Orders Placed</b>\n\n"
+                                        grid_msg += f"• Index: {self.current_idx}\n"
+                                        grid_msg += f"• Amount: {trade_amount}\n"
+                                        grid_msg += f"• Orders: 6 layers (3 BUY + 3 SELL)\n\n"
+                                        grid_msg += f"✅ Ready for market movements"
+                                        self.telegram_bot.send_message(grid_msg, chat_id=chat_id, disable_notification=False)
+                                except Exception as e:
+                                    self.logger.error(f"Error placing grid after resume: {e}")
+                                    if self.telegram_bot:
+                                        self.telegram_bot.send_message(f"⚠️ Error placing grid orders: {e}", chat_id=chat_id)
                         else:
                             welcome_msg = f"👋 <b>Hello!</b>\n\n"
                             welcome_msg += f"• Account: {account_number}\n\n"

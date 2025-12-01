@@ -5,7 +5,6 @@ Consolidates common logic used across all main_xxx.py instances.
 
 import logging
 import time
-import os
 from datetime import datetime, timedelta, timezone
 
 
@@ -67,6 +66,7 @@ class GridDCAStrategy:
         self.start_balance = 0
         self.max_drawdown = 0
         self.notified_filled = set()
+        self.notified_tp = set()  # Track TP filled orders
         
         # Control flags
         self.bot_paused = True  # Start paused, require manual /start
@@ -327,6 +327,36 @@ class GridDCAStrategy:
     def get_gmt7_time(self):
         """Get current time in GMT+7 timezone."""
         return datetime.now(timezone(timedelta(hours=7)))
+    
+    def is_quiet_hours(self):
+        """Check if current time is within quiet hours (reduced risk period)."""
+        if not self.quiet_hours_enabled:
+            return False
+        
+        current_time_gmt7 = self.get_gmt7_time()
+        current_hour = current_time_gmt7.hour
+        
+        # Handle wrap-around (e.g., 23:00 to 02:00)
+        if self.quiet_hours_start <= self.quiet_hours_end:
+            return self.quiet_hours_start <= current_hour <= self.quiet_hours_end
+        else:
+            return current_hour >= self.quiet_hours_start or current_hour <= self.quiet_hours_end
+    
+    def get_adjusted_trade_amount(self):
+        """Get trade amount adjusted for quiet hours and overrides."""
+        # Check for permanent override first
+        if self.next_trade_amount is not None:
+            base_amount = self.next_trade_amount
+        else:
+            base_amount = self.trade_amount
+        
+        # Apply quiet hours reduction if active
+        if self.is_quiet_hours():
+            adjusted_amount = base_amount * self.quiet_hours_factor
+            self.logger.info(f"🕰️ Quiet hours active: Trade amount reduced to {adjusted_amount} (factor: {self.quiet_hours_factor})")
+            return adjusted_amount
+        
+        return base_amount
     
     def place_pending_order(self, symbol, order_type, price, tp_price, volume=0.01, comment=""):
         """Place a pending order (buy stop or sell stop)."""
@@ -902,10 +932,23 @@ class GridDCAStrategy:
             start_balance = self.get_current_balance()
             self.start_balance = start_balance
             
-            # Initial grid placement
-            self.run_at_index(symbol, trade_amount, index=self.current_idx, price=0)
+            # Send initial status message (no automatic trading)
+            if self.telegram_bot:
+                initial_msg = (
+                    f"🤖 <b>Grid DCA Strategy Initialized</b>\n\n"
+                    f"┌─────────────────────────────┐\n"
+                    f"│     ⏸️ <b>AWAITING START</b>     │\n"
+                    f"└─────────────────────────────┘\n\n"
+                    f"📊 <b>Configuration:</b>\n"
+                    f"┣━ 📈 Symbol: <code>{symbol}</code>\n"
+                    f"┣━ 💰 Trade Amount: <code>{trade_amount}</code>\n"
+                    f"┣━ 💳 Account Balance: <code>${start_balance:.2f}</code>\n"
+                    f"┗━ ⚙️ Magic Number: <code>{self.magic_number}</code>\n\n"
+                    f"🚀 <b>Ready to trade - Send <code>/start</code> to begin!</b>\n\n"
+                    f"⚠️ <i>No orders will be placed until you start the strategy</i>"
+                )
+                self.telegram_bot.send_message(initial_msg, chat_id=self.telegram_chat_id)
             
-            notified_tp = set()
             closed_pnl = 0
             
             idx = 0
@@ -1042,6 +1085,59 @@ class GridDCAStrategy:
                     
                 except Exception as e:
                     self.logger.debug(f"Blackout check error: {e}")
+
+                # Automatic Trading Halt Check (4:30AM-6:15AM GMT+7 News Protection)
+                try:
+                    if self.trading_halt_enabled:
+                        current_time_gmt7 = self.get_gmt7_time()
+                        current_hour = current_time_gmt7.hour
+                        current_minute = current_time_gmt7.minute
+                        
+                        # Check if we're in trading halt period (4:30 AM to 6:15 AM)
+                        in_halt_period = (
+                            (current_hour == self.trading_halt_start and current_minute >= self.trading_halt_start_minutes) or  # 4:30-4:59 AM
+                            (self.trading_halt_start < current_hour < self.trading_halt_end) or  # 5:00-5:59 AM  
+                            (current_hour == self.trading_halt_end and current_minute < self.trading_halt_end_minutes)  # 6:00-6:14 AM
+                        )
+                        
+                        # Update trading halt status and notify if changed
+                        previous_halt_status = self.trading_halt_active
+                        self.trading_halt_active = in_halt_period
+                        
+                        # Notify status change
+                        if previous_halt_status != self.trading_halt_active:
+                            if self.trading_halt_active:
+                                halt_msg = (
+                                    f"🛑 <b>Trading Halt ACTIVATED</b>\n\n"
+                                    f"┌─────────────────────────────┐\n"
+                                    f"│  📰 <b>News Protection Period</b>  │\n"
+                                    f"└─────────────────────────────┘\n\n"
+                                    f"🕐 <b>Halt Schedule:</b>\n"
+                                    f"┣━ 🚫 No new orders: <code>04:30-06:15 GMT+7</code>\n"
+                                    f"┣━ ⏰ Current time: <code>{current_hour:02d}:{current_minute:02d} GMT+7</code>\n"
+                                    f"┗━ 🔄 Auto-resume at: <code>06:15 GMT+7</code>\n\n"
+                                    f"✅ <b>Active positions and orders remain untouched</b>\n"
+                                    f"🛡️ <b>Risk management continues normally</b>"
+                                )
+                                self.logger.info(f"🛑 Trading halt ACTIVATED at {current_hour:02d}:{current_minute:02d} GMT+7")
+                            else:
+                                halt_msg = (
+                                    f"✅ <b>Trading Halt DEACTIVATED</b>\n\n"
+                                    f"┌─────────────────────────────┐\n"
+                                    f"│    🔄 <b>NORMAL TRADING</b>     │\n"
+                                    f"└─────────────────────────────┘\n\n"
+                                    f"📈 <b>Trading Resumed:</b>\n"
+                                    f"┣━ ✅ New orders: <b>ALLOWED</b>\n"
+                                    f"┣━ ⏰ Current time: <code>{current_hour:02d}:{current_minute:02d} GMT+7</code>\n"
+                                    f"┗━ 🛡️ News protection: <b>Completed</b>\n\n"
+                                    f"🚀 <b>Strategy is now active for normal trading!</b>"
+                                )
+                                self.logger.info(f"✅ Trading halt DEACTIVATED at {current_hour:02d}:{current_minute:02d} GMT+7")
+                            
+                            if self.telegram_bot:
+                                self.telegram_bot.send_message(halt_msg, chat_id=self.telegram_chat_id, disable_notification=False)
+                except Exception as e:
+                    self.logger.debug(f"Trading halt time check error: {e}")
                 
                 # Check if bot is paused
                 if self.bot_paused:
@@ -1075,6 +1171,7 @@ class GridDCAStrategy:
                     skip_reason = "blackout window"
                 elif self.quiet_hours_enabled and self.is_quiet_hours():
                     # Note: quiet hours reduces trade amount but doesn't skip orders
+                    # We don't set skip_new_orders=True for quiet hours
                     pass
                 
                 # Skip order placement if any halt condition is active
@@ -1164,11 +1261,11 @@ class GridDCAStrategy:
                 
                 # Check if positions closed (TP filled)
                 for oid in self.notified_filled:
-                    if oid not in notified_tp:
+                    if oid not in self.notified_tp:
                         if self.check_position_closed(oid):
                             pnl = self.pos_closed_pnl(oid)
                             closed_pnl += pnl
-                            notified_tp.add(oid)
+                            self.notified_tp.add(oid)
                             self._track_metric('tps_reached')  # Track TP reached
                             hit_index = None
                             hit_side = None
@@ -1199,7 +1296,7 @@ class GridDCAStrategy:
                             self.logger.info(f"❤️ :: {order_comment} :: TP filled: Position ID {oid} closed | P&L: ${pnl:.2f} All Closed P&L: ${closed_pnl:.2f}")
                             self.notified_tp.add(oid)
                             self._track_metric('tps_reached')  # Track TP reached
-                            self.logger.info(f"TP filled order IDs: {notified_tp}")
+                            self.logger.info(f"TP filled order IDs: {self.notified_tp}")
                             self.logger.info(f"TP filled: {hit_side} order index {self.current_idx} (ID {oid}) closed. TP price: {hit_tp_price}")
                             
                             # Calculate cycle time
@@ -1295,7 +1392,7 @@ class GridDCAStrategy:
                     # Reset state
                     self.detail_orders = {key: {'status': None} for key in self.detail_orders.keys()}
                     self.notified_filled.clear()
-                    notified_tp.clear()
+                    self.notified_tp.clear()
                     self.current_idx = 0
                     closed_pnl = 0
                     self.max_drawdown = 0
@@ -1383,11 +1480,11 @@ class GridDCAStrategy:
         """
         if not self.telegram_bot:
             return
-        
+
         try:
-            # Get updates from Telegram with offset to avoid processing same updates
+            # Get updates from Telegram with reduced timeout to prevent blocking
             offset = self.last_telegram_update_id + 1 if self.last_telegram_update_id else None
-            updates = self.telegram_bot.bot.get_updates(timeout=1, offset=offset)
+            updates = self.telegram_bot.bot.get_updates(timeout=0.5, offset=offset)  # Reduced from 1 to 0.5
             
             for update in updates:
                 # Update the last processed update_id
@@ -1435,6 +1532,15 @@ class GridDCAStrategy:
                                     f"✅ <b>Ready for trading operations!</b>"
                                 )
                                 self.telegram_bot.send_message(welcome_msg, chat_id=chat_id, disable_notification=False)
+                                
+                                # Place initial grid only after /start command
+                                try:
+                                    self.run_at_index(self.trade_symbol, self.trade_amount, index=self.current_idx, price=0)
+                                    self.logger.info(f"✅ Initial grid placed after /start command")
+                                except Exception as grid_error:
+                                    self.logger.error(f"Error placing initial grid: {grid_error}")
+                                    error_msg = f"⚠️ <b>Grid Placement Error</b>\n\nFailed to place initial orders. Check logs for details.\n\nError: {str(grid_error)[:100]}"
+                                    self.telegram_bot.send_message(error_msg, chat_id=chat_id, disable_notification=False)
                             else:
                                 resume_msg = (
                                     f"▶️ <b>Bot Resumed!</b> ▶️\n\n"
@@ -1722,6 +1828,7 @@ class GridDCAStrategy:
                                 self.stop_requested = False
                                 self.detail_orders.clear()
                                 self.notified_filled.clear()
+                                self.notified_tp.clear()
                                 
                                 self.telegram_bot.send_message(
                                     "🛑 <b>PANIC STOP Executed</b>\n\n"
@@ -2044,6 +2151,7 @@ class GridDCAStrategy:
                             # Reset strategy state
                             self.detail_orders = {}
                             self.notified_filled.clear()
+                            self.notified_tp.clear()
                             self.current_idx = 0
                             self.max_drawdown = 0
                             
@@ -2326,5 +2434,18 @@ class GridDCAStrategy:
                             self.logger.error(f"Error handling /pattern: {e}")
                             self.telegram_bot.send_message("❌ Failed to compute pattern.", chat_id=chat_id, disable_notification=False)
 
-        except Exception as e:
-            self.logger.error(f"Error in handle_telegram_command: {e}")
+        except Exception as telegram_error:
+            # Handle various Telegram errors gracefully
+            error_msg = str(telegram_error).lower()
+            if 'timed out' in error_msg:
+                # Timeout is normal, just continue without logging as error
+                pass
+            elif 'connection pool is full' in error_msg:
+                # Connection pool issue - brief pause to let connections recover
+                time.sleep(0.1)
+            elif 'network' in error_msg or 'connection' in error_msg:
+                # Network issues - brief pause and continue
+                time.sleep(0.2)
+            else:
+                # Log other unexpected errors
+                self.logger.debug(f"Telegram command error: {telegram_error}")
